@@ -1,67 +1,27 @@
 #!/usr/bin/env python3
 """
-Git Graph Visualizer with Multi–Level Visual Grouping
+Git Graph Visualizer with Multi–Level Visual Grouping and Dump/Read–Dump Functionality
 
-This script operates in two modes:
+This script operates in several modes:
 
 1. Git Object Graph Mode (default):
    Parses a Git repository (its .git folder) and generates a Graphviz diagram
-   of its commits, trees, blobs, and branches. Various options control colors,
-   edge styling, metadata, and now grouping of repetitive elements.
+   of its commits, trees, blobs, and branches.
 
 2. Combined Repository Base Mode (--repo-base):
-   Recursively scans a base folder for all Git repositories (directories containing
+   Recursively scans a base folder for Git repositories (directories containing
    a “.git” folder) and produces one PDF that shows the overall project directory
    structure plus, side by side, subgraphs for each repository’s Git object graph.
 
-New grouping functionality (when “--group” is enabled) lets you “condense” nodes
-that share common text (for example, many blobs with the same name) into a single
-record–shaped node. The record’s left field shows the common text and the right
-field lists the differences (for example, a short hash). Unique, visible colors are
-generated per group and applied to both the node and connecting edges. The degree
-of visual condensation is adjustable with “--group-condense-level” and the types
-of nodes to group are given by “--group-types” (a comma–separated list of types among:
-blob, tree, commit, branch).
+3. Dump Mode (--dump):
+   Instead of generating a graph, this mode produces a JSON “dump” of the internal
+   Git repository model (branches, commits, trees, blobs, and relationships).
 
-Other options include:
-  --colors             Enable unique colors for node types and add a legend.
-  -o, --output-only    Save the output to file only (don’t open the viewer).
-  --local              Show only local branches (skip remote branches).
-  -P N, --predecessors N
-                       Limit the number of predecessor (parent) edges shown per commit.
-                       Extra edges are drawn dotted.
-  -S N, --successors N
-                       Limit the number of successor (child) edges shown per commit.
-                       Extra edges are drawn dotted.
-  --dotted [remote/local/all]
-                       Force the given group(s) of branch edges to be drawn dotted.
-  -M META, --metadata META
-                       Comma–separated list of metadata keys to include in commit labels.
-                       Available keys: flags, author, short, gitstat. Default: all.
-  --group              Enable multi–level grouping of nodes with similar text.
-  --group-types TYPE   Comma–separated list of node types to group.
-                       Options: blob, tree, commit, branch. Default: blob,tree.
-  --group-condense-level N
-                       An integer (default 1) controlling the amount of detail in grouped nodes.
-  --repo-base PATH     Instead of a single Git repo, scan the given base folder for
-                       repositories and generate one PDF with subgraphs for each repo plus
-                       an overall project directory structure.
-  --verbose            Enable verbose output (debug messages).
+4. Read Dump Mode (--read-dump):
+   Reads a previously generated dump file and produces a graph based on the data.
 
-Examples:
-  $ python3 git-graph.py
-      Generate the Git object graph for the current repository.
-
-  $ python3 git-graph.py --colors -o --local -P 1 -S 2 --dotted remote -M author,flags,short
-      Generate a colored Git graph of the current repo with limited parent/child edges,
-      forcing remote branch edges dotted, and including only author, flags and short hash.
-
-  $ python3 git-graph.py --group --group-types blob,tree --group-condense-level 1
-      Generate the Git graph for the current repo with grouping of blobs and trees.
-      
-  $ python3 git-graph.py --repo-base /path/to/project --colors --group --group-types blob,tree --verbose
-      Recursively scan /path/to/project for Git repositories and produce one PDF that shows
-      the overall project structure plus a subgraph for each repository with grouping enabled.
+Other options include node grouping, colorization, metadata filtering, edge‐limits,
+and safety limits when scanning file trees.
 
 Requirements:
   - Python 3.5+
@@ -71,6 +31,7 @@ Requirements:
 import argparse
 import collections
 import colorsys
+import json
 import logging
 import os
 import re
@@ -79,6 +40,7 @@ import subprocess
 import sys
 from collections import defaultdict
 from graphviz import Digraph
+from types import SimpleNamespace
 from typing import Dict, Set, List
 
 # --- Git object types ---
@@ -89,7 +51,6 @@ Blob = collections.namedtuple('Blob', 'hash name')
 Hash = str
 
 # --- Helper Functions ---
-
 def sanitize_id(s: str) -> str:
     """Sanitize a string for use as a Graphviz node ID."""
     return re.sub(r'\W+', '_', s)
@@ -113,10 +74,9 @@ def get_distinct_color(index: int, total: int) -> str:
 def draw_grouped_nodes(subgraph: Digraph, nodes: List[dict], node_type: str,
                        prefix: str, config: dict) -> None:
     """
-    Given a list of node dictionaries (each with keys: id, common, differentiator, full_label, attrs),
-    group them by the common text. If a group contains only one element, draw it normally.
-    Otherwise, draw a single record–shaped node that shows the common part on the left and
-    the differentiators (one per variant) on the right. A unique group color is used.
+    Group a list of node dictionaries (each with keys: id, common, differentiator, full_label, attrs)
+    by the common text. Single–element groups are drawn normally; groups with multiple elements
+    are drawn as a record–shaped node.
     """
     groups = defaultdict(list)
     for node in nodes:
@@ -133,7 +93,6 @@ def draw_grouped_nodes(subgraph: Digraph, nodes: List[dict], node_type: str,
             record_label = f"{{{common}|{diffs}\\l}}"
             group_node_id = make_node_id(prefix, node_type, common)
             group_color = get_distinct_color(group_index, total_groups)
-            # Override attributes for grouped node.
             attrs = {'shape': 'record', 'style': 'filled', 'color': group_color,
                      'fontsize': str(10 + 2 * (1 - config.get('group_condense_level', 1)))}
             subgraph.node(group_node_id, label=record_label, **attrs)
@@ -346,8 +305,74 @@ class GitRepo:
         self.commit_gitstat[commit_hash] = stat
         return stat
 
+# --- Dump/Load Support for Repository Data ---
+def dump_git_repo(git_repo: GitRepo, dump_file: str) -> None:
+    """Serialize the GitRepo’s data into a JSON dump file."""
+    data = {
+        "branches": [branch._asdict() for branch in git_repo.branches],
+        "commits": {h: commit._asdict() for h, commit in git_repo.cache.items() if isinstance(commit, Commit)},
+        "trees": {h: tree._asdict() for h, tree in git_repo.cache.items() if isinstance(tree, Tree)},
+        "blobs": {h: blob._asdict() for h, blob in git_repo.blobs.items()},
+        "commit_to_tree": git_repo.commit_to_tree,
+        "commit_to_branches": git_repo.commit_to_branches,
+        "branch_to_commit": git_repo.branch_to_commit,
+        "commit_to_parents": {k: list(v) for k, v in git_repo.commit_to_parents.items()},
+        "commit_to_children": {k: list(v) for k, v in git_repo.commit_to_children.items()},
+        "tree_to_blobs": {k: list(v) for k, v in git_repo.tree_to_blobs.items()},
+        "tree_to_trees": {k: list(v) for k, v in git_repo.tree_to_trees.items()},
+        "commit_gitstat": git_repo.commit_gitstat,
+    }
+    try:
+        with open(dump_file, 'w') as f:
+            json.dump(data, f, indent=2)
+        logging.info("Dumped repository data to '%s'", dump_file)
+    except Exception as e:
+        logging.error("Failed to write dump file '%s': %s", dump_file, e)
+        sys.exit(1)
+
+class DumpedRepo:
+    """
+    A lightweight repository–like class constructed from a dump.
+    Provides the attributes and methods needed by the graph–generation routines.
+    """
+    def __init__(self, data: dict):
+        self.branches = [SimpleNamespace(**b) for b in data.get("branches", [])]
+        self.commits = data.get("commits", {})
+        self.trees = data.get("trees", {})
+        self.blobs = {h: SimpleNamespace(**b) for h, b in data.get("blobs", {}).items()}
+        self.commit_to_tree = data.get("commit_to_tree", {})
+        self.commit_to_branches = data.get("commit_to_branches", {})
+        self.branch_to_commit = data.get("branch_to_commit", {})
+        self.commit_to_children = data.get("commit_to_children", {})
+        self.tree_to_blobs = data.get("tree_to_blobs", {})
+        self.tree_to_trees = data.get("tree_to_trees", {})
+        self.commit_gitstat = data.get("commit_gitstat", {})
+
+    def get_tree(self, tree_hash: str) -> SimpleNamespace:
+        tree_data = self.trees.get(tree_hash)
+        if tree_data is None:
+            raise Exception(f"Tree {tree_hash} not found in dump.")
+        return SimpleNamespace(**tree_data)
+
+    def get_commit(self, commit_hash: str) -> SimpleNamespace:
+        commit_data = self.commits.get(commit_hash)
+        if commit_data is None:
+            raise Exception(f"Commit {commit_hash} not found in dump.")
+        return SimpleNamespace(**commit_data)
+
+def load_git_repo_dump(dump_file: str) -> DumpedRepo:
+    """Load the JSON dump file and return a DumpedRepo instance."""
+    try:
+        with open(dump_file, 'r') as f:
+            data = json.load(f)
+        logging.info("Loaded dump from '%s'", dump_file)
+        return DumpedRepo(data)
+    except Exception as e:
+        logging.error("Failed to load dump file '%s': %s", dump_file, e)
+        sys.exit(1)
+
 # --- Formatting for commit labels ---
-def format_commit_label(commit: Commit, git_repo: GitRepo, config: dict) -> str:
+def format_commit_label(commit, git_repo, config: dict) -> str:
     label = commit.hash[:6]
     meta = config['metadata']
     if meta == "all" or ("author" in meta):
@@ -366,12 +391,12 @@ def format_commit_label(commit: Commit, git_repo: GitRepo, config: dict) -> str:
     return label
 
 # --- Graph Generation for a Single Repository (as a subgraph) ---
-def add_git_repo_subgraph(master: Digraph, git_repo: GitRepo, config: dict,
+def add_git_repo_subgraph(master: Digraph, git_repo, config: dict,
                           prefix: str, repo_label: str) -> None:
     """
     Add a subgraph (cluster) for one repository’s Git object graph.
     All node IDs are prefixed with the given prefix.
-    This routine now supports grouping of repetitive nodes.
+    Supports grouping of repetitive nodes.
     """
     drawn_edges = set()
     repo_cluster = master.subgraph(name=f"cluster_repo_{sanitize_id(prefix)}")
@@ -381,16 +406,18 @@ def add_git_repo_subgraph(master: Digraph, git_repo: GitRepo, config: dict,
     if config.get('group_enabled', False) and 'blob' in config.get('group_types', []):
         nodes_list = []
         for blob in git_repo.blobs.values():
-            node_id = make_node_id(prefix, "blob", blob.hash)
-            common = blob.name  # group by blob name
-            differentiator = blob.hash[:6]
-            full_label = f"{blob.name} {blob.hash[:6]}"
+            # blob might be a Blob (namedtuple) or a SimpleNamespace
+            blob_name = getattr(blob, 'name', str(blob))
+            blob_hash = getattr(blob, 'hash', '')
+            node_id = make_node_id(prefix, "blob", blob_hash)
+            common = blob_name  # group by blob name
+            differentiator = blob_hash[:6]
+            full_label = f"{blob_name} {blob_hash[:6]}"
             attrs = {'shape': 'ellipse', 'style': 'filled'}
             if config['colors']:
                 attrs['color'] = config['colors_map']['blob']
             nodes_list.append({"id": node_id, "common": common,
                                "differentiator": differentiator, "full_label": full_label, "attrs": attrs})
-        # Create a dedicated subgraph for grouped blobs.
         group_blob_sg = repo_cluster.subgraph(name=f"cluster_{prefix}_grouped_blobs")
         group_blob_sg.attr(label="Blobs", color="gray")
         draw_grouped_nodes(group_blob_sg, nodes_list, "blob", prefix, config)
@@ -398,8 +425,10 @@ def add_git_repo_subgraph(master: Digraph, git_repo: GitRepo, config: dict,
         with repo_cluster.subgraph(name=f"cluster_{prefix}_blobs") as blob_sg:
             blob_sg.attr(label='Blobs', color='gray')
             for blob in git_repo.blobs.values():
-                nid = make_node_id(prefix, "blob", blob.hash)
-                label = f"{blob.name} {blob.hash[:6]}"
+                blob_name = getattr(blob, 'name', str(blob))
+                blob_hash = getattr(blob, 'hash', '')
+                nid = make_node_id(prefix, "blob", blob_hash)
+                label = f"{blob_name} {blob_hash[:6]}"
                 attrs = {'shape': 'ellipse', 'style': 'filled'}
                 if config['colors']:
                     attrs['color'] = config['colors_map']['blob']
@@ -408,6 +437,7 @@ def add_git_repo_subgraph(master: Digraph, git_repo: GitRepo, config: dict,
     # --- Trees ---
     if config.get('group_enabled', False) and 'tree' in config.get('group_types', []):
         nodes_list = []
+        # Use the union of tree hashes that have children (either blobs or trees)
         tree_keys = set(git_repo.tree_to_blobs.keys()).union(set(git_repo.tree_to_trees.keys()))
         for tree_hash in tree_keys:
             try:
@@ -415,10 +445,11 @@ def add_git_repo_subgraph(master: Digraph, git_repo: GitRepo, config: dict,
             except Exception as e:
                 logging.error("Skipping tree %s: %s", tree_hash, e)
                 continue
-            node_id = make_node_id(prefix, "tree", tree_hash)
-            common = tree_obj.name  # group by tree name
+            # When grouping, use the common property (here, the tree’s name)
+            common = tree_obj.name
             differentiator = tree_hash[:6]
             full_label = f"{tree_obj.name} {tree_obj.hash[:6]}"
+            node_id = make_node_id(prefix, "tree", common)
             attrs = {'shape': 'triangle'}
             if config['colors']:
                 attrs['color'] = config['colors_map']['tree']
@@ -430,43 +461,60 @@ def add_git_repo_subgraph(master: Digraph, git_repo: GitRepo, config: dict,
     else:
         with repo_cluster.subgraph(name=f"cluster_{prefix}_trees") as tree_sg:
             tree_sg.attr(label='Trees', color='gray')
+            # Process trees that have blobs
             for tree_hash, blob_hashes in git_repo.tree_to_blobs.items():
                 try:
                     tree_obj = git_repo.get_tree(tree_hash)
                 except Exception as e:
                     logging.error("Skipping tree %s due to error: %s", tree_hash, e)
                     continue
-                tree_node = f"{tree_obj.name} {tree_obj.hash[:6]}"
+                if config.get('group_enabled', False) and 'tree' in config.get('group_types', []):
+                    tree_nid = make_node_id(prefix, "tree", tree_obj.name)
+                else:
+                    tree_nid = make_node_id(prefix, "tree", tree_hash)
+                label = f"{tree_obj.name} {tree_obj.hash[:6]}"
                 attrs = {'shape': 'triangle'}
                 if config['colors']:
                     attrs['color'] = config['colors_map']['tree']
-                tree_sg.node(tree_node, **attrs)
+                tree_sg.node(tree_nid, label=label, **attrs)
                 for blob_hash in blob_hashes:
                     try:
-                        blob_node = f"{git_repo.blobs[blob_hash].name} {blob_hash[:6]}"
+                        blob = git_repo.blobs[blob_hash]
+                        blob_name = getattr(blob, 'name', str(blob))
                     except KeyError:
                         logging.warning("Blob %s not found in cache", blob_hash)
                         continue
-                    tree_sg.edge(tree_node, blob_node, minlen='2', constraint='true')
+                    blob_nid = make_node_id(prefix, "blob", blob_hash)
+                    tree_sg.edge(tree_nid, blob_nid, minlen='2', constraint='true')
+            # Process tree–to–tree edges
             for tree_hash, subtree_hashes in git_repo.tree_to_trees.items():
                 try:
                     tree_obj = git_repo.get_tree(tree_hash)
                 except Exception as e:
                     logging.error("Skipping tree %s: %s", tree_hash, e)
                     continue
-                tree_node = f"{tree_obj.name} {tree_obj.hash[:6]}"
+                if config.get('group_enabled', False) and 'tree' in config.get('group_types', []):
+                    tree_nid = make_node_id(prefix, "tree", tree_obj.name)
+                else:
+                    tree_nid = make_node_id(prefix, "tree", tree_hash)
+                label = f"{tree_obj.name} {tree_obj.hash[:6]}"
                 attrs = {'shape': 'triangle'}
                 if config['colors']:
                     attrs['color'] = config['colors_map']['tree']
-                tree_sg.node(tree_node, **attrs)
+                tree_sg.node(tree_nid, label=label, **attrs)
                 for subtree_hash in subtree_hashes:
                     try:
                         subtree_obj = git_repo.get_tree(subtree_hash)
                     except Exception as e:
                         logging.error("Skipping subtree %s: %s", subtree_hash, e)
                         continue
-                    subtree_node = f"{subtree_obj.name} {subtree_obj.hash[:6]}"
-                    tree_sg.edge(tree_node, subtree_node, minlen='2', constraint='true')
+                    if config.get('group_enabled', False) and 'tree' in config.get('group_types', []):
+                        subtree_nid = make_node_id(prefix, "tree", subtree_obj.name)
+                    else:
+                        subtree_nid = make_node_id(prefix, "tree", subtree_hash)
+                    subtree_label = f"{subtree_obj.name} {subtree_obj.hash[:6]}"
+                    tree_sg.node(subtree_nid, label=subtree_label, **attrs)
+                    tree_sg.edge(tree_nid, subtree_nid, minlen='2', constraint='true')
                     
     # --- Commits ---
     with repo_cluster.subgraph(name=f"cluster_{prefix}_commits") as commit_sg:
@@ -485,13 +533,18 @@ def add_git_repo_subgraph(master: Digraph, git_repo: GitRepo, config: dict,
             commit_sg.node(commit_nid, **attrs)
             try:
                 tree_obj = git_repo.get_tree(tree_hash)
-                tree_nid = make_node_id(prefix, "tree", tree_hash)
+                # When grouping trees, use the tree name as the key
+                if config.get('group_enabled', False) and 'tree' in config.get('group_types', []):
+                    tree_nid = make_node_id(prefix, "tree", tree_obj.name)
+                else:
+                    tree_nid = make_node_id(prefix, "tree", tree_hash)
                 edge_key = (commit_nid, tree_nid)
                 if edge_key not in drawn_edges:
                     commit_sg.edge(commit_nid, tree_nid, minlen='2')
                     drawn_edges.add(edge_key)
             except Exception as e:
                 logging.error("Error linking commit %s to tree %s: %s", commit_hash, tree_hash, e)
+        # Link commit–to–parent and commit–to–child edges.
         for commit_hash in git_repo.commit_to_tree.keys():
             try:
                 commit_obj = git_repo.get_commit(commit_hash)
@@ -564,10 +617,20 @@ def generate_combined_repo_graph(repo_base_path: str, config: dict) -> None:
     and generate one PDF document containing:
       1. A cluster for the overall project directory structure.
       2. A cluster for all detected Git repositories (each added as a subgraph).
+    Safety measures:
+      - The scan will not proceed if repo_base_path appears to be a system root.
+      - A maximum recursion depth (--max-depth) is enforced.
     """
+    abs_repo_base = os.path.abspath(repo_base_path)
+    if abs_repo_base in ['/', os.path.sep]:
+        logging.error("Refusing to scan system root '%s'", abs_repo_base)
+        sys.exit(1)
     logging.info("Scanning for Git repositories under '%s'", repo_base_path)
     git_repos = []
-    for root, dirs, _ in os.walk(repo_base_path):
+    for root, dirs, _ in os.walk(repo_base_path, topdown=True, followlinks=False):
+        # Do not descend outside of repo_base_path (safety)
+        if os.path.abspath(root) != abs_repo_base and not os.path.commonpath([abs_repo_base, os.path.abspath(root)]) == abs_repo_base:
+            continue
         if '.git' in dirs:
             repo_abs = os.path.join(root)
             rel_path = os.path.relpath(repo_abs, repo_base_path)
@@ -585,11 +648,14 @@ def generate_combined_repo_graph(repo_base_path: str, config: dict) -> None:
     proj_cluster = master.subgraph(name="cluster_project_structure")
     proj_cluster.attr(label="Project Structure", color="black")
     node_counter = [0]
-    def process_directory(dir_path: str, parent_id: str = None):
+    def process_directory(dir_path: str, parent_id: str = None, depth: int = 0, max_depth: int = config.get('max_depth', 10)):
         try:
             entries = os.listdir(dir_path)
         except Exception as e:
             logging.error("Cannot list directory '%s': %s", dir_path, e)
+            return
+        # Safety: do not descend beyond the max depth.
+        if depth > max_depth:
             return
         current_id = sanitize_id(os.path.abspath(dir_path))
         label = os.path.basename(dir_path) if os.path.basename(dir_path) else dir_path
@@ -598,8 +664,11 @@ def generate_combined_repo_graph(repo_base_path: str, config: dict) -> None:
             proj_cluster.edge(parent_id, current_id)
         for entry in sorted(entries):
             full_path = os.path.join(dir_path, entry)
+            # Ensure we remain under repo_base_path.
+            if not os.path.abspath(full_path).startswith(os.path.abspath(repo_base_path)):
+                continue
             if os.path.isdir(full_path):
-                process_directory(full_path, current_id)
+                process_directory(full_path, current_id, depth + 1, max_depth)
             else:
                 file_id = sanitize_id(os.path.abspath(full_path)) + f"_{node_counter[0]}"
                 node_counter[0] += 1
@@ -634,9 +703,8 @@ class GraphGenerator:
     def __init__(self, config: dict):
         self.config = config
 
-    def generate_graph(self, git_repo: GitRepo) -> None:
+    def generate_graph(self, git_repo) -> None:
         logging.info("Generating Git object graph (single repository mode)")
-        # Instead of building the graph here from scratch, call add_git_repo_subgraph
         master = Digraph(comment='Git graph', format='pdf')
         master.attr(compound='true', splines='true', overlap='false')
         add_git_repo_subgraph(master, git_repo, self.config, prefix="single", repo_label="Repository")
@@ -669,7 +737,9 @@ def parse_arguments() -> dict:
         description='Generate a Graphviz diagram of a Git repository or a combined view of multiple repos.\n\n'
                     'Examples:\n'
                     '  python3 git-graph.py --colors -o --local -P 1 -S 2 --dotted remote -M author,flags,short\n'
-                    '  python3 git-graph.py --repo-base /path/to/project --colors --group --group-types blob,tree --verbose',
+                    '  python3 git-graph.py --repo-base /path/to/project --colors --group --group-types blob,tree --verbose\n'
+                    '  python3 git-graph.py --dump\n'
+                    '  python3 git-graph.py --read-dump my_dump.json',
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument('path', nargs='?', default=os.getcwd(),
@@ -700,6 +770,16 @@ def parse_arguments() -> dict:
                         help='Level of visual condensation for grouped nodes (higher means more condensed; default: 1)')
     parser.add_argument('--repo-base', type=str,
                         help='Path to the repository base folder to generate a combined diagram of all Git repos found')
+    parser.add_argument('--max-depth', type=int, default=10,
+                        help='Maximum depth when scanning directories in repo-base mode (default: 10)')
+    # New dump/read-dump arguments (mutually exclusive with normal modes)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--dump', action='store_true',
+                       help='Generate a JSON dump of the repository data (instead of a graph)')
+    group.add_argument('--read-dump', type=str,
+                       help='Read repository dump from file and generate a graph')
+    parser.add_argument('--dump-file', type=str, default="git_repo_dump.json",
+                        help='Filename for dump output (used with --dump)')
     parser.add_argument('--verbose', action='store_true',
                         help='Enable verbose output')
     args = parser.parse_args()
@@ -723,9 +803,16 @@ def parse_arguments() -> dict:
         },
         'group_enabled': args.group,
         'group_types': [x.strip().lower() for x in args.group_types.split(',')] if args.group_types else [],
-        'group_condense_level': args.group_condense_level
+        'group_condense_level': args.group_condense_level,
+        'max_depth': args.max_depth
     }
-    return {'repo_path': args.path, 'config': config, 'repo_base': args.repo_base, 'verbose': args.verbose}
+    return {'repo_path': args.path,
+            'config': config,
+            'repo_base': args.repo_base,
+            'dump': args.dump,
+            'dump_file': args.dump_file,
+            'read_dump': args.read_dump,
+            'verbose': args.verbose}
 
 def main() -> None:
     args = parse_arguments()
@@ -733,7 +820,18 @@ def main() -> None:
     logging.basicConfig(level=log_level, format='%(levelname)s: %(message)s')
     check_dependencies()
     try:
-        if args['repo_base']:
+        # If a dump file is to be generated, use the provided repository path.
+        if args['dump']:
+            repo_path = get_git_repo_path(args['repo_path'])
+            git_repo = GitRepo(repo_path, local_only=args['config']['local_only'])
+            git_repo.parse_dot_git_dir()
+            dump_git_repo(git_repo, args['dump_file'])
+        # If a dump file is to be read, load it and generate the graph.
+        elif args['read_dump']:
+            dumped_repo = load_git_repo_dump(args['read_dump'])
+            GraphGenerator(args['config']).generate_graph(dumped_repo)
+        # Combined repository base mode.
+        elif args['repo_base']:
             if not os.path.isdir(args['repo_base']):
                 logging.error("Invalid repository base path: '%s'", args['repo_base'])
                 sys.exit(1)
