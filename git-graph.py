@@ -2,30 +2,24 @@
 """
 Git Graph Visualizer with Multi–Level Visual Grouping and Dump/Read–Dump Functionality
 
-This script operates in several modes:
+Modes:
+  1) Default single–repo mode
+  2) --repo-base to combine multiple repos into one PDF
+  3) --dump to write JSON data describing the repo
+  4) --read-dump to read a previously dumped JSON and render a graph
 
-1. Git Object Graph Mode (default):
-   Parses a Git repository (its .git folder) and generates a Graphviz diagram
-   of its commits, trees, blobs, and branches.
+Supports:
+  - Local only branches (–-local)
+  - Limit commit parents/children edges (–P, –S)
+  - Grouping node types (–-group, –-group-types)
+  - Optional color legend
+  - “Dotted” edges for local or remote branches
+  - Dump/Load from JSON
 
-2. Combined Repository Base Mode (--repo-base):
-   Recursively scans a base folder for Git repositories (directories containing
-   a .git folder) and produces one PDF that shows the overall project directory
-   structure plus subgraphs for each repository’s Git object graph.
-
-3. Dump Mode (--dump):
-   Instead of generating a graph, this mode produces a JSON dump of the internal
-   Git repository model (branches, commits, trees, blobs, and relationships).
-
-4. Read Dump Mode (--read-dump):
-   Reads a previously generated dump file and produces a graph based on the data.
-
-Other options include node grouping, colorization, metadata filtering, edge‐limits,
-and safety limits when scanning file trees.
-
-Requirements:
-  - Python 3.5+
-  - Graphviz (the “dot” command must be installed and available in PATH)
+Requires:
+  - Python 3.x
+  - `pip install graphviz`
+  - Graphviz’s `dot` command in PATH
 """
 
 import argparse
@@ -50,18 +44,21 @@ Tree = collections.namedtuple('Tree', 'hash name trees blobs')
 Blob = collections.namedtuple('Blob', 'hash name')
 Hash = str
 
-# --- Helper Functions ---
+# -------------------------------------------------------------------
+#                   UTILITY / HELPER FUNCTIONS
+# -------------------------------------------------------------------
+
 def sanitize_id(s: str) -> str:
-    """Sanitize a string for use as a Graphviz node ID."""
+    """Sanitize a string for use as a Graphviz node ID (remove weird chars)."""
     return re.sub(r'\W+', '_', s)
 
 def make_node_id(prefix: str, typ: str, identifier: str) -> str:
-    """Generate a namespaced node ID."""
+    """Create a canonical node ID for graphviz, e.g. prefix_commit_abcd."""
     return f"{prefix}_{typ}_{sanitize_id(identifier)}"
 
 def get_distinct_color(index: int, total: int) -> str:
     """
-    Generate a distinct hex color using HLS.
+    Generate a distinct hex color using HLS approach.
     Returns a hex string (e.g. '#aabbcc').
     """
     if total <= 0:
@@ -70,13 +67,27 @@ def get_distinct_color(index: int, total: int) -> str:
     r, g, b = colorsys.hls_to_rgb(hue, 0.6, 0.7)
     return '#{:02x}{:02x}{:02x}'.format(int(r*255), int(g*255), int(b*255))
 
+def create_subgraph(parent: Digraph, name: str, label: str = None, color: str = None) -> Digraph:
+    """
+    Creates a new subgraph inside 'parent' with the specified name and label.
+    We call __enter__() to treat it like a with-block, if supported.
+    """
+    sub = parent.subgraph(name=name)
+    if hasattr(sub, '__enter__'):
+        sub = sub.__enter__()
+    if label:
+        sub.attr(label=label)
+    if color:
+        sub.attr(color=color)
+    return sub
+
 def draw_grouped_nodes(subgraph: Digraph, nodes: List[dict], node_type: str,
                        prefix: str, config: dict) -> None:
     """
-    Given a list of node dictionaries (each with keys: id, common, differentiator,
-    full_label, attrs), group them by the 'common' text. Single–element groups are drawn
-    normally; groups with multiple elements are drawn as a record–shaped node.
+    For each node dictionary in 'nodes', group them by 'common'. If a group has only 1 node,
+    just draw it as usual; if multiple, we use a record shape with each differentiator.
     """
+    from collections import defaultdict
     groups = defaultdict(list)
     for node in nodes:
         groups[node["common"]].append(node)
@@ -84,11 +95,12 @@ def draw_grouped_nodes(subgraph: Digraph, nodes: List[dict], node_type: str,
     group_index = 0
     for common, group_nodes in groups.items():
         if len(group_nodes) == 1:
+            # Single node
             n = group_nodes[0]
             subgraph.node(n['id'], label=n['full_label'], **n.get('attrs', {}))
         else:
-            # Build a record label: {common | diff1 \l diff2 \l ...}
-            diffs = "\\l".join(node["differentiator"] for node in group_nodes)
+            # Build a record-like label
+            diffs = "\\l".join(nd["differentiator"] for nd in group_nodes)
             record_label = f"{{{common}|{diffs}\\l}}"
             group_node_id = make_node_id(prefix, node_type, common)
             group_color = get_distinct_color(group_index, total_groups)
@@ -101,221 +113,293 @@ def draw_grouped_nodes(subgraph: Digraph, nodes: List[dict], node_type: str,
             subgraph.node(group_node_id, label=record_label, **attrs)
             group_index += 1
 
-def create_subgraph(parent: Digraph, name: str, label: str = None, color: str = None) -> Digraph:
-    """
-    Helper function to create a subgraph, then set its attributes.
-    This version handles the Graphviz subgraph context manager by calling __enter__() immediately.
-    """
-    sub = parent.subgraph(name=name)
-    if hasattr(sub, '__enter__'):
-        sub = sub.__enter__()
-    if label:
-        sub.attr(label=label)
-    if color:
-        sub.attr(color=color)
-    return sub
+# -------------------------------------------------------------------
+#                     GIT REPO MODEL AND PARSER
+# -------------------------------------------------------------------
 
-# --- Git Repository Data Model ---
 class GitRepo:
     """
-    Represents a parsed Git repository, with commits, trees, blobs, and branches.
+    Represents a parsed Git repository: references (branches), commits, trees, blobs.
     """
     def __init__(self, git_repo_path: str, local_only: bool = False):
         self.git_repo_path = os.path.abspath(git_repo_path)
         self.dot_git_dir = os.path.join(self.git_repo_path, '.git')
         self.local_only = local_only
-        
-        # Caches and indices
-        self.cache: Dict[Hash, object] = {}  # commits or trees
+
+        # Cache of objects read from cat-file
+        self.cache: Dict[Hash, object] = {}
+        # Lists/dicts for branches => commits
         self.branches: List[Branch] = []
         self.branch_to_commit: Dict[str, Hash] = {}
         self.commit_to_branches: Dict[Hash, List[str]] = defaultdict(list)
+        # Commit relationships
         self.commit_to_parents: Dict[Hash, Set[Hash]] = defaultdict(set)
+        self.commit_to_children: Dict[Hash, Set[Hash]] = defaultdict(set)
+        # Commit => associated tree
         self.commit_to_tree: Dict[Hash, Hash] = {}
+        # Tree => subtrees, Tree => blobs
         self.tree_to_trees: Dict[Hash, Set[Hash]] = defaultdict(set)
         self.tree_to_blobs: Dict[Hash, Set[Hash]] = defaultdict(set)
         self.blobs: Dict[Hash, Blob] = {}
-        self.commit_to_children: Dict[Hash, Set[Hash]] = defaultdict(set)
+        # Optional commit stats from 'git show --stat'
         self.commit_gitstat: Dict[Hash, str] = {}
+        
+        # Internal store of discovered references
+        self._all_refs: Dict[str, str] = {}
 
     def parse_dot_git_dir(self) -> None:
         """
-        Parses the Git repo data: references, commits, and trees.
+        Main entry point: discovers references, parses commits, builds relationships.
         """
         logging.info("Parsing .git directory at '%s'", self.dot_git_dir)
-
-        # Gather references from HEAD, loose refs, and packed-refs
         self._gather_references()
 
-        # Convert references to Branch objects.
-        # (We treat any reference in refs/remotes/* as remote.)
-        self.branches = []
-        for ref_name, commit_hash in self._all_references.items():
+        # Turn references into Branch objects
+        self.branches.clear()
+        for ref_name, commit_hash in self._all_refs.items():
             if not commit_hash:
                 continue
-            # Distinguish remote vs local by naming convention
             is_remote = ref_name.startswith("refs/remotes/")
-            # Also store a short branch name for display
-            if is_remote:
-                short_name = ref_name.replace("refs/remotes/", "", 1)
-            else:
-                short_name = ref_name.replace("refs/heads/", "", 1)
-            # If local_only, skip remote references
             if self.local_only and is_remote:
                 continue
+            # short name
+            short_name = ref_name
+            if ref_name.startswith("refs/heads/"):
+                short_name = ref_name.replace("refs/heads/", "", 1)
+            elif ref_name.startswith("refs/remotes/"):
+                short_name = ref_name.replace("refs/remotes/", "", 1)
             self.branches.append(Branch(name=short_name, commit=commit_hash, remote=is_remote))
             self.branch_to_commit[short_name] = commit_hash
             self.commit_to_branches[commit_hash].append(short_name)
 
+        # If somehow no references were found, fallback to HEAD if it’s a direct hash
+        if not self.branches:
+            head_file = os.path.join(self.dot_git_dir, 'HEAD')
+            if os.path.isfile(head_file):
+                head_val = self._read_txt(head_file)
+                if re.match(r'^[0-9a-f]{4,40}$', head_val):
+                    # Treat HEAD as a single 'HEAD' branch
+                    logging.info("No references found; using HEAD as a detached branch.")
+                    self.branches.append(Branch(name='HEAD', commit=head_val, remote=False))
+                    self.branch_to_commit['HEAD'] = head_val
+                    self.commit_to_branches[head_val].append('HEAD')
+
+        # Traverse each branch's commit history
         visited: Set[Hash] = set()
-        for branch in self.branches:
+        for br in self.branches:
             try:
-                self.traverse_history(branch.commit, visited)
+                self._traverse_history(br.commit, visited)
             except Exception as e:
-                logging.error("Error traversing history for branch %s: %s", branch.name, e)
+                logging.warning("Unable to traverse branch %s: %s", br.name, e)
 
-        self.build_commit_children()
+        # Build commit children from commit_to_parents
+        self._build_commit_children()
 
-    def list_branches(self) -> List[Branch]:
-        """
-        (Deprecated old function to keep the code structure unchanged.)
-        Now this returns the final list of branches found by parse_dot_git_dir().
-        """
-        return self.branches
+    # -------------- GATHERING REFERENCES (HEAD, loose refs, packed-refs) --------------
 
-    def traverse_history(self, commit_hash: Hash, visited: Set[Hash]) -> None:
+    def _gather_references(self) -> None:
         """
-        Recursively traverse commit parents, building up commit_to_parents
-        and storing each commit in self.cache.
+        Gathers references from HEAD, .git/refs, and .git/packed-refs.
+        Fills self._all_refs with e.g. {'refs/heads/main': <hash>, 'refs/remotes/origin/main': <hash>, etc.}
         """
+        self._all_refs.clear()
+
+        # 1) HEAD
+        head_file = os.path.join(self.dot_git_dir, 'HEAD')
+        if os.path.isfile(head_file):
+            head_content = self._read_txt(head_file)
+            if head_content.startswith('ref: '):
+                # symbolic ref: "ref: refs/heads/main"
+                ref_path = head_content[5:].strip()
+                commit_hash = self._resolve_ref(ref_path)
+                if commit_hash:
+                    self._all_refs[ref_path] = commit_hash
+            else:
+                # Possibly a direct commit hash (detached HEAD)
+                if re.match(r'^[0-9a-fA-F]{4,40}$', head_content):
+                    self._all_refs['HEAD'] = head_content
+
+        # 2) Loose references in .git/refs/
+        refs_base = os.path.join(self.dot_git_dir, 'refs')
+        if os.path.isdir(refs_base):
+            for root, dirs, files in os.walk(refs_base):
+                for f in files:
+                    full_path = os.path.join(root, f)
+                    ref_name = os.path.relpath(full_path, self.dot_git_dir).replace("\\", "/")
+                    val = self._read_txt(full_path)
+                    if re.match(r'^[0-9a-fA-F]{4,40}$', val):
+                        self._all_refs[ref_name] = val
+                    else:
+                        logging.debug("Skipping non-hash ref %s => %s", ref_name, val)
+
+        # 3) packed-refs
+        packed_refs = os.path.join(self.dot_git_dir, 'packed-refs')
+        if os.path.isfile(packed_refs):
+            try:
+                with open(packed_refs, 'r') as pf:
+                    for line in pf:
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        if line.startswith('^'):
+                            # line with '^<object>', typically the tag’s object
+                            continue
+                        parts = line.split(None, 1)
+                        if len(parts) == 2:
+                            ref_hash, ref_full = parts
+                            if re.match(r'^[0-9a-fA-F]{4,40}$', ref_hash):
+                                # store it
+                                self._all_refs[ref_full] = ref_hash
+            except Exception as e:
+                logging.warning("Error reading packed-refs: %s", e)
+
+    def _resolve_ref(self, ref_path: str) -> Optional[str]:
+        """
+        Given 'refs/heads/main' or similar, resolve to a commit hash if possible.
+        """
+        # 1) If there's a loose ref file
+        full_ref = os.path.join(self.dot_git_dir, ref_path)
+        if os.path.isfile(full_ref):
+            val = self._read_txt(full_ref)
+            if re.match(r'^[0-9a-fA-F]{4,40}$', val):
+                return val
+        # 2) Check in packed-refs
+        packed_refs = os.path.join(self.dot_git_dir, 'packed-refs')
+        if os.path.isfile(packed_refs):
+            try:
+                with open(packed_refs, 'r') as pf:
+                    for line in pf:
+                        line = line.strip()
+                        if not line or line.startswith('#') or line.startswith('^'):
+                            continue
+                        parts = line.split(None, 1)
+                        if len(parts) == 2:
+                            ref_hash, name = parts
+                            if name == ref_path and re.match(r'^[0-9a-fA-F]{4,40}$', ref_hash):
+                                return ref_hash
+            except Exception as e:
+                logging.warning("Error searching packed-refs for %s: %s", ref_path, e)
+        return None
+
+    # ----------------- HISTORY TRAVERSAL / COMMIT PARSING -------------------
+
+    def _traverse_history(self, commit_hash: Hash, visited: Set[Hash]) -> None:
+        """Recursively load commits from commit_hash back through all parents."""
         if not commit_hash or commit_hash in visited:
             return
         visited.add(commit_hash)
-        commit_obj: Optional[Commit] = None
-        try:
-            commit_obj = self.get_commit(commit_hash)
-        except Exception as e:
-            # Possibly a shallow or missing object; log and skip.
-            logging.warning("Skipping missing commit %s: %s", commit_hash, e)
 
-        if not commit_obj:
+        try:
+            cobj = self.get_commit(commit_hash)
+        except Exception as e:
+            logging.warning("Skipping commit %s: %s", commit_hash, e)
             return
 
-        for parent_hash in commit_obj.parents:
-            self.commit_to_parents[commit_hash].add(parent_hash)
-            self.traverse_history(parent_hash, visited)
+        for parent in cobj.parents:
+            self.commit_to_parents[commit_hash].add(parent)
+            self._traverse_history(parent, visited)
 
-    def build_commit_children(self) -> None:
-        """
-        Invert commit_to_parents to populate commit_to_children for graph edges.
-        """
+    def _build_commit_children(self) -> None:
+        """Inverts commit_to_parents so child -> parent becomes parent -> child."""
         for child, parents in self.commit_to_parents.items():
-            for parent in parents:
-                self.commit_to_children[parent].add(child)
+            for p in parents:
+                self.commit_to_children[p].add(child)
+
+    # ----------------- LAZY LOAD COMMIT / TREE / BLOB ---------------------
 
     def get_commit(self, hash: Hash) -> Commit:
-        """
-        Return a commit object from cache or by reading it via git cat-file.
-        """
+        """Return commit from cache or cat-file. Raise if not found."""
         if hash in self.cache and isinstance(self.cache[hash], Commit):
             return self.cache[hash]  # type: ignore
 
-        content = self.git_cat_file(hash)
-        commit_obj = self.parse_commit(hash, content)
+        content = self._git_cat_file(hash)
+        commit_obj = self._parse_commit(hash, content)
         self.cache[hash] = commit_obj
+
+        # store commit->tree
         self.commit_to_tree[commit_obj.hash] = commit_obj.tree
 
-        # Also load the tree to populate tree info
+        # load that tree (in case we want to link commits->trees->blobs)
         try:
             self.get_tree(commit_obj.tree)
         except Exception as e:
-            logging.warning("Error retrieving tree %s for commit %s: %s", commit_obj.tree, hash, e)
+            logging.warning("Could not load tree %s for commit %s: %s", commit_obj.tree, hash, e)
 
         return commit_obj
 
-    def parse_commit(self, hash: Hash, content: str) -> Commit:
-        """
-        Parse the raw text of a commit object into a Commit namedtuple.
-        """
-        commit_data = {'hash': hash, 'tree': None, 'parents': [], 'author': "Unknown"}
+    def _parse_commit(self, hash: Hash, content: str) -> Commit:
+        """Parse the raw commit text to a Commit namedtuple."""
+        tree_hash = None
+        parents = []
+        author = "Unknown"
         author_found = False
+
         for line in content.splitlines():
-            line = line.rstrip("\n")
-            if not line.strip():
-                # Commit message or blank line
+            line = line.rstrip()
+            if not line:
                 continue
             parts = line.split()
             if not parts:
                 continue
             key = parts[0]
             if key == 'tree' and len(parts) >= 2:
-                commit_data['tree'] = parts[1]
+                tree_hash = parts[1]
             elif key == 'parent' and len(parts) >= 2:
-                commit_data['parents'].append(parts[1])
+                parents.append(parts[1])
             elif key == 'author' and not author_found:
-                commit_data['author'] = ' '.join(parts[1:]) if len(parts) > 1 else "Unknown"
                 author_found = True
+                author = ' '.join(parts[1:]) if len(parts) > 1 else "Unknown"
 
-        if not commit_data['tree']:
+        if not tree_hash:
             raise ValueError(f"Commit {hash} missing tree pointer.")
-        return Commit(**commit_data)  # type: ignore
+        return Commit(hash=hash, tree=tree_hash, parents=parents, author=author)
 
     def get_tree(self, hash: Hash, name: str = '/') -> Tree:
-        """
-        Return a Tree object from cache or by reading it via git cat-file.
-        """
+        """Return tree object from cache or cat-file."""
         if hash in self.cache and isinstance(self.cache[hash], Tree):
             return self.cache[hash]  # type: ignore
 
-        content = self.git_cat_file(hash)
-        tree_obj = self.parse_tree(hash, name, content)
-
-        # Update internal mappings
-        for b_hash in tree_obj.blobs:
-            self.tree_to_blobs[hash].add(b_hash)
-        for t_hash in tree_obj.trees:
-            self.tree_to_trees[hash].add(t_hash)
-
+        content = self._git_cat_file(hash)
+        tree_obj = self._parse_tree(hash, name, content)
         self.cache[hash] = tree_obj
+
+        # fill tree->blobs, tree->trees
+        for b in tree_obj.blobs:
+            self.tree_to_blobs[hash].add(b)
+        for t in tree_obj.trees:
+            self.tree_to_trees[hash].add(t)
         return tree_obj
 
-    def parse_tree(self, hash: Hash, name: str, content: str) -> Tree:
-        """
-        Parse the raw text of a tree object into a Tree namedtuple.
-        """
-        trees_list = []
-        blobs_list = []
-
+    def _parse_tree(self, hash: Hash, name: str, content: str) -> Tree:
+        """Parse the raw tree text to a Tree namedtuple."""
+        subtrees = []
+        blobs = []
         for line in content.splitlines():
             line = line.strip()
             if not line:
                 continue
-            # Typical line format: "<mode> <type> <hash>\t<filename>"
-            # git cat-file -p tree can also show e.g.: "100644 blob f3bfc etc"
+            # typical: "100644 blob a1b2c3d4 fileName"
             parts = re.split(r'\s+', line, maxsplit=3)
             if len(parts) < 4:
                 logging.debug("Skipping malformed tree entry in %s: %r", hash, line)
                 continue
-
-            _, obj_type, child_hash, child_name = parts
+            mode, obj_type, child_hash, child_name = parts
             if obj_type == 'tree':
-                trees_list.append(child_hash)
-                # Recursively parse subtree (on-demand)
+                subtrees.append(child_hash)
+                # parse that subtree on-demand
                 try:
                     self.get_tree(child_hash, child_name)
                 except Exception as e:
-                    logging.warning("Error processing subtree %s: %s", child_hash, e)
-                    continue
+                    logging.warning("Error reading subtree %s: %s", child_hash, e)
             elif obj_type == 'blob':
-                blobs_list.append(child_hash)
+                blobs.append(child_hash)
                 self.blobs[child_hash] = Blob(hash=child_hash, name=child_name)
+        return Tree(hash=hash, name=name, trees=subtrees, blobs=blobs)
 
-        return Tree(hash=hash, name=name, trees=trees_list, blobs=blobs_list)
+    # ----------------- SHELL COMMANDS ----------------------
 
-    def git_cat_file(self, hash: Hash) -> str:
-        """
-        Runs 'git cat-file -p <hash>' and returns the stdout as a string.
-        """
+    def _git_cat_file(self, hash: Hash) -> str:
+        """Runs 'git cat-file -p <hash>' and returns content."""
         try:
             result = subprocess.run(
                 ['git', 'cat-file', '-p', hash],
@@ -327,28 +411,10 @@ class GitRepo:
             return result.stdout.decode('utf-8', errors='replace')
         except subprocess.CalledProcessError as e:
             err = e.stderr.decode('utf-8', errors='replace').strip()
-            logging.warning("git cat-file failed for hash %s: %s", hash, err)
-            raise Exception(f"Object {hash} not found.")
-        except Exception as e:
-            logging.warning("Unexpected error in git_cat_file for hash %s: %s", hash, e)
-            raise
-
-    def read_txt(self, file_path: str) -> str:
-        """
-        Return the stripped text content of a file.
-        """
-        try:
-            with open(file_path, 'r') as f:
-                return f.read().strip()
-        except Exception as e:
-            logging.error("Error reading file '%s': %s", file_path, e)
-            return ""
+            raise Exception(f"git cat-file failed for {hash}: {err}")
 
     def get_git_stat(self, commit_hash: Hash) -> str:
-        """
-        Runs 'git show --stat --oneline -s <commit>' to get the short stats,
-        caches them, and returns them.
-        """
+        """Show short stats for a commit."""
         if commit_hash in self.commit_gitstat:
             return self.commit_gitstat[commit_hash]
         try:
@@ -362,153 +428,63 @@ class GitRepo:
             stat = result.stdout.decode('utf-8', errors='replace')
         except subprocess.CalledProcessError as e:
             err = e.stderr.decode('utf-8', errors='replace').strip()
-            logging.warning("git show --stat failed for commit %s: %s", commit_hash, err)
-            stat = ""
-        except Exception as e:
-            logging.warning("Unexpected error in get_git_stat for commit %s: %s", commit_hash, e)
+            logging.debug("git show --stat failed for %s: %s", commit_hash, err)
             stat = ""
         self.commit_gitstat[commit_hash] = stat
         return stat
 
-    # ----------------------------------------------------------
-    #      Reference Gathering from HEAD, Refs, and Packed-Refs
-    # ----------------------------------------------------------
+    # ----------------- MISC READ FILE ----------------------
 
-    def _gather_references(self) -> None:
-        """
-        Internal method to gather references from HEAD, loose refs in .git/refs,
-        and .git/packed-refs. Populates self._all_references with refname->commit.
-        """
-        self._all_references: Dict[str, str] = {}
+    def _read_txt(self, path: str) -> str:
+        """Return content of a text file or empty string on error."""
+        try:
+            with open(path, 'r') as f:
+                return f.read().strip()
+        except Exception as e:
+            logging.debug("Could not read file %s: %s", path, e)
+            return ""
 
-        # 1) HEAD (could be a direct commit or symbolic ref)
-        head_ref = os.path.join(self.dot_git_dir, 'HEAD')
-        if os.path.isfile(head_ref):
-            head_content = self.read_txt(head_ref)
-            # Usually: "ref: refs/heads/main" or just a commit hash
-            if head_content.startswith("ref: "):
-                ref_path = head_content[5:].strip()
-                commit_hash = self._try_resolve_ref(ref_path)
-                if commit_hash:
-                    self._all_references[ref_path] = commit_hash
-            else:
-                # HEAD might be a direct hash (detached)
-                # Validate that it looks like a commit
-                if re.match(r'^[0-9a-fA-F]{4,40}$', head_content):
-                    # We'll store it as a "HEAD" ref
-                    self._all_references["HEAD"] = head_content
+# -------------------------------------------------------------------
+#             DUMP / LOAD REPOSITORY TO/FROM JSON
+# -------------------------------------------------------------------
 
-        # 2) Loose references in .git/refs/* 
-        refs_dir = os.path.join(self.dot_git_dir, 'refs')
-        if os.path.isdir(refs_dir):
-            for root, _, files in os.walk(refs_dir):
-                for f in files:
-                    full_path = os.path.join(root, f)
-                    # The "canonical" ref name would be root[len(.git/)+1..] + "/" + f
-                    # E.g.: .git/refs/heads/master => "refs/heads/master"
-                    ref_name = os.path.relpath(full_path, self.dot_git_dir).replace("\\", "/")
-                    commit_hash = self.read_txt(full_path)
-                    # Validate commit
-                    if re.match(r'^[0-9a-fA-F]{4,40}$', commit_hash):
-                        self._all_references[ref_name] = commit_hash
-                    else:
-                        logging.debug("Skipping non-commit ref %s => %s", ref_name, commit_hash)
-
-        # 3) Packed-refs in .git/packed-refs
-        packed_refs = os.path.join(self.dot_git_dir, 'packed-refs')
-        if os.path.isfile(packed_refs):
-            try:
-                with open(packed_refs, 'r') as pf:
-                    for line in pf:
-                        line = line.strip()
-                        if not line or line.startswith('#'):
-                            continue
-                        if line.startswith('^'):
-                            # ^ means it's the object hash of an annotated tag,
-                            # we skip because we only want the commit references.
-                            # If you want tags, handle them here.
-                            continue
-                        # Typically: "<hash> <refname>"
-                        parts = line.split(None, 1)
-                        if len(parts) == 2:
-                            ref_hash, ref_name = parts
-                            if re.match(r'^[0-9a-fA-F]{4,40}$', ref_hash):
-                                # We only gather heads/remotes if local_only=False. 
-                                # But let's store them all; filter later in parse_dot_git_dir.
-                                self._all_references[ref_name] = ref_hash
-            except Exception as e:
-                logging.warning("Error reading packed-refs: %s", e)
-
-    def _try_resolve_ref(self, ref_name: str) -> Optional[str]:
-        """
-        Attempt to read the reference by its file path under .git, or from packed-refs.
-        Return a commit hash or None.
-        """
-        # 1) Check if there's a loose ref file
-        ref_path = os.path.join(self.dot_git_dir, ref_name)
-        if os.path.isfile(ref_path):
-            commit_hash = self.read_txt(ref_path)
-            if re.match(r'^[0-9a-fA-F]{4,40}$', commit_hash):
-                return commit_hash
-
-        # 2) Check packed-refs
-        packed_refs = os.path.join(self.dot_git_dir, 'packed-refs')
-        if os.path.isfile(packed_refs):
-            try:
-                with open(packed_refs, 'r') as pf:
-                    for line in pf:
-                        line = line.strip()
-                        if line.startswith('#') or not line:
-                            continue
-                        if line.startswith('^'):
-                            continue
-                        parts = line.split(None, 1)
-                        if len(parts) == 2:
-                            ref_hash, name = parts
-                            if name == ref_name and re.match(r'^[0-9a-fA-F]{4,40}$', ref_hash):
-                                return ref_hash
-            except Exception as e:
-                logging.warning("Error reading packed-refs: %s", e)
-
-        return None
-
-# --- Dump/Load Support for Repository Data ---
 def dump_git_repo(git_repo: GitRepo, dump_file: str) -> None:
-    """Serialize the GitRepo’s data into a JSON dump file."""
+    """
+    Serialize the repository data into a JSON file.
+    """
     data = {
-        "branches": [branch._asdict() for branch in git_repo.branches],
+        "branches": [b._asdict() for b in git_repo.branches],
         "commits": {
-            h: commit._asdict() for h, commit in git_repo.cache.items()
-            if isinstance(commit, Commit)
+            h: c._asdict() for h, c in git_repo.cache.items()
+            if isinstance(c, Commit)
         },
         "trees": {
-            h: tree._asdict() for h, tree in git_repo.cache.items()
-            if isinstance(tree, Tree)
+            h: t._asdict() for h, t in git_repo.cache.items()
+            if isinstance(t, Tree)
         },
-        "blobs": {
-            h: blob._asdict() for h, blob in git_repo.blobs.items()
-        },
+        "blobs": {h: b._asdict() for h, b in git_repo.blobs.items()},
+
         "commit_to_tree": git_repo.commit_to_tree,
-        "commit_to_branches": git_repo.commit_to_branches,
-        "branch_to_commit": git_repo.branch_to_commit,
         "commit_to_parents": {k: list(v) for k, v in git_repo.commit_to_parents.items()},
         "commit_to_children": {k: list(v) for k, v in git_repo.commit_to_children.items()},
+        "commit_to_branches": git_repo.commit_to_branches,
+        "branch_to_commit": git_repo.branch_to_commit,
+
         "tree_to_blobs": {k: list(v) for k, v in git_repo.tree_to_blobs.items()},
         "tree_to_trees": {k: list(v) for k, v in git_repo.tree_to_trees.items()},
-        "commit_gitstat": git_repo.commit_gitstat,
+        "commit_gitstat": git_repo.commit_gitstat
     }
     try:
         with open(dump_file, 'w') as f:
             json.dump(data, f, indent=2)
         logging.info("Dumped repository data to '%s'", dump_file)
     except Exception as e:
-        logging.error("Failed to write dump file '%s': %s", dump_file, e)
+        logging.error("Failed writing dump file '%s': %s", dump_file, e)
         sys.exit(1)
 
 class DumpedRepo:
     """
-    A lightweight repository–like class constructed from a dump.
-    Provides the attributes and methods needed by the graph–generation routines.
+    Lightweight repo-like object that can be used by the same graph logic.
     """
     def __init__(self, data: dict):
         self.branches = [SimpleNamespace(**b) for b in data.get("branches", [])]
@@ -518,583 +494,577 @@ class DumpedRepo:
             h: SimpleNamespace(**b) for h, b in data.get("blobs", {}).items()
         }
         self.commit_to_tree = data.get("commit_to_tree", {})
+        self.commit_to_parents = {k: set(v) for k, v in data.get("commit_to_parents", {}).items()}
+        self.commit_to_children = {k: set(v) for k, v in data.get("commit_to_children", {}).items()}
         self.commit_to_branches = data.get("commit_to_branches", {})
         self.branch_to_commit = data.get("branch_to_commit", {})
-        self.commit_to_children = data.get("commit_to_children", {})
-        self.tree_to_blobs = data.get("tree_to_blobs", {})
-        self.tree_to_trees = data.get("tree_to_trees", {})
+        self.tree_to_blobs = {k: set(v) for k, v in data.get("tree_to_blobs", {}).items()}
+        self.tree_to_trees = {k: set(v) for k, v in data.get("tree_to_trees", {}).items()}
         self.commit_gitstat = data.get("commit_gitstat", {})
 
-    def get_tree(self, tree_hash: str) -> SimpleNamespace:
-        tree_data = self.trees.get(tree_hash)
-        if tree_data is None:
-            raise Exception(f"Tree {tree_hash} not found in dump.")
-        return SimpleNamespace(**tree_data)
-
     def get_commit(self, commit_hash: str) -> SimpleNamespace:
-        commit_data = self.commits.get(commit_hash)
-        if commit_data is None:
-            raise Exception(f"Commit {commit_hash} not found in dump.")
-        return SimpleNamespace(**commit_data)
+        c = self.commits.get(commit_hash)
+        if not c:
+            raise KeyError(f"DumpedRepo: commit {commit_hash} not found in dump.")
+        return SimpleNamespace(**c)
+
+    def get_tree(self, tree_hash: str) -> SimpleNamespace:
+        t = self.trees.get(tree_hash)
+        if not t:
+            raise KeyError(f"DumpedRepo: tree {tree_hash} not found in dump.")
+        return SimpleNamespace(**t)
+
+    def get_git_stat(self, commit_hash: str) -> str:
+        """Provide a similar method so the label code doesn't crash."""
+        return self.commit_gitstat.get(commit_hash, "")
+
+# -------------------------------------------------------------------
+#               LOADING A REPO FROM AN EXISTING JSON DUMP
+# -------------------------------------------------------------------
 
 def load_git_repo_dump(dump_file: str) -> DumpedRepo:
-    """Load the JSON dump file and return a DumpedRepo instance."""
+    """
+    Load the JSON dump file from disk into a DumpedRepo.
+    """
     try:
         with open(dump_file, 'r') as f:
             data = json.load(f)
         logging.info("Loaded dump from '%s'", dump_file)
         return DumpedRepo(data)
     except Exception as e:
-        logging.error("Failed to load dump file '%s': %s", dump_file, e)
+        logging.error("Failed loading dump file '%s': %s", dump_file, e)
         sys.exit(1)
 
-# --- Formatting for commit labels ---
-def format_commit_label(commit, git_repo, config: dict) -> str:
-    """
-    Build a text label for a commit, given the user-chosen metadata in config.
-    """
-    label = commit.hash[:6]
-    meta = config['metadata']
-    # If meta is a set, check membership. If it's 'all', show everything.
-    def want(key: str) -> bool:
-        return meta == 'all' or (isinstance(meta, set) and key in meta)
+# -------------------------------------------------------------------
+#               GRAPH GENERATION (SINGLE REPO SUBGRAPH)
+# -------------------------------------------------------------------
 
-    # Show author
+def format_commit_label(commit, repo_obj, config: dict) -> str:
+    """
+    Build a multi-line label for a commit node, based on user-chosen metadata.
+    """
+    label = commit.hash[:6]  # short hash
+    meta = config['metadata']
+
+    def want(key: str) -> bool:
+        if meta == 'all':
+            return True
+        if isinstance(meta, set) and key in meta:
+            return True
+        return False
+
+    # show author
     if want("author"):
         label += "\n" + commit.author
 
-    # Show local/remote flags
+    # show local/remote flags
     if want("flags"):
+        # e.g. L or R
         flags = []
-        if commit.hash in git_repo.commit_to_branches:
-            for b in git_repo.commit_to_branches[commit.hash]:
-                # If there's a slash, call it remote
-                flags.append("R" if '/' in b else "L")
+        # commit_to_branches => hash -> [branch1, branch2]
+        if commit.hash in repo_obj.commit_to_branches:
+            for b in repo_obj.commit_to_branches[commit.hash]:
+                # if slash => remote
+                if '/' in b:
+                    flags.append('R')
+                else:
+                    flags.append('L')
             flags = sorted(set(flags))
-            label += "\n(" + "/".join(flags) + ")"
+            if flags:
+                label += "\n(" + "/".join(flags) + ")"
 
-    # Show short stats
+    # show short stats
     if want("gitstat"):
-        stat = git_repo.get_git_stat(commit.hash)
+        stat = repo_obj.get_git_stat(commit.hash)
         if stat:
             label += "\n" + stat.strip()
 
     return label
 
-# --- Graph Generation for a Single Repository (as a subgraph) ---
-def add_git_repo_subgraph(master: Digraph, git_repo, config: dict,
+def add_git_repo_subgraph(master: Digraph, repo_obj, config: dict,
                           prefix: str, repo_label: str) -> None:
     """
-    Add a subgraph (cluster) for one repository’s Git object graph.
-    All node IDs are prefixed with the given prefix.
-    Supports grouping of repetitive nodes.
+    Add all commits/branches/trees/blobs from 'repo_obj' into the given 'master' Digraph,
+    inside a subgraph cluster. Node IDs are namespaced by 'prefix'.
     """
     drawn_edges = set()
-    repo_cluster = create_subgraph(
-        master, f"cluster_repo_{sanitize_id(prefix)}",
-        label=repo_label, color='blue'
-    )
-    
-    # --- Blobs ---
-    if config.get('group_enabled', False) and 'blob' in config.get('group_types', []):
-        nodes_list = []
-        for blob in git_repo.blobs.values():
-            blob_name = getattr(blob, 'name', str(blob))
-            blob_hash = getattr(blob, 'hash', '')
+
+    repo_cluster = create_subgraph(master,
+                                   name=f"cluster_repo_{sanitize_id(prefix)}",
+                                   label=repo_label,
+                                   color='blue')
+
+    # -------------- BLOB NODES --------------
+    if config.get('group_enabled') and 'blob' in config.get('group_types', []):
+        # group them by filename
+        blob_list = []
+        for blob_hash, blob in repo_obj.blobs.items():
             node_id = make_node_id(prefix, "blob", blob_hash)
-            common = blob_name  # group by blob name
-            differentiator = blob_hash[:6]
-            full_label = f"{blob_name} {blob_hash[:6]}"
+            blob_label = f"{blob.name} {blob_hash[:6]}"
+            blob_list.append({
+                'id': node_id,
+                'common': blob.name,
+                'differentiator': blob_hash[:6],
+                'full_label': blob_label,
+                'attrs': {
+                    'shape': 'ellipse',
+                    'style': 'filled',
+                    'color': config['colors_map']['blob'] if config['colors'] else 'black'
+                }
+            })
+        sg = create_subgraph(repo_cluster, f"cluster_{prefix}_grouped_blobs", "Blobs", "gray")
+        draw_grouped_nodes(sg, blob_list, "blob", prefix, config)
+    else:
+        sg = create_subgraph(repo_cluster, f"cluster_{prefix}_blobs", "Blobs", "gray")
+        for blob_hash, blob in repo_obj.blobs.items():
+            node_id = make_node_id(prefix, "blob", blob_hash)
+            label = f"{blob.name} {blob_hash[:6]}"
             attrs = {'shape': 'ellipse', 'style': 'filled'}
             if config['colors']:
                 attrs['color'] = config['colors_map']['blob']
-            nodes_list.append({
-                "id": node_id, "common": common,
-                "differentiator": differentiator,
-                "full_label": full_label, "attrs": attrs
+            sg.node(node_id, label=label, **attrs)
+
+    # -------------- TREE NODES --------------
+    if config.get('group_enabled') and 'tree' in config.get('group_types', []):
+        # We'll group trees by name
+        all_tree_hashes = set(repo_obj.tree_to_blobs.keys()) | set(repo_obj.tree_to_trees.keys())
+        tree_nodes = []
+        for th in all_tree_hashes:
+            try:
+                tobj = repo_obj.get_tree(th)
+            except Exception as e:
+                logging.warning("Skipping tree %s: %s", th, e)
+                continue
+            node_id = make_node_id(prefix, "tree", tobj.name)
+            full_label = f"{tobj.name} {tobj.hash[:6]}"
+            tree_nodes.append({
+                'id': node_id,
+                'common': tobj.name,
+                'differentiator': tobj.hash[:6],
+                'full_label': full_label,
+                'attrs': {
+                    'shape': 'triangle',
+                    'color': config['colors_map']['tree'] if config['colors'] else 'black'
+                }
             })
-        group_blob_sg = create_subgraph(
-            repo_cluster, f"cluster_{prefix}_grouped_blobs",
-            label="Blobs", color="gray"
-        )
-        draw_grouped_nodes(group_blob_sg, nodes_list, "blob", prefix, config)
+        sg = create_subgraph(repo_cluster, f"cluster_{prefix}_grouped_trees", "Trees", "gray")
+        draw_grouped_nodes(sg, tree_nodes, "tree", prefix, config)
     else:
-        blob_sg = create_subgraph(
-            repo_cluster, f"cluster_{prefix}_blobs",
-            label="Blobs", color="gray"
-        )
-        for blob in git_repo.blobs.values():
-            blob_name = getattr(blob, 'name', str(blob))
-            blob_hash = getattr(blob, 'hash', '')
-            nid = make_node_id(prefix, "blob", blob_hash)
-            label = f"{blob_name} {blob_hash[:6]}"
-            attrs = {'shape': 'ellipse', 'style': 'filled'}
-            if config['colors']:
-                attrs['color'] = config['colors_map']['blob']
-            blob_sg.node(nid, label=label, **attrs)
-                
-    # --- Trees ---
-    if config.get('group_enabled', False) and 'tree' in config.get('group_types', []):
-        nodes_list = []
-        tree_keys = set(git_repo.tree_to_blobs.keys()).union(
-            set(git_repo.tree_to_trees.keys())
-        )
-        for tree_hash in tree_keys:
+        sg = create_subgraph(repo_cluster, f"cluster_{prefix}_trees", "Trees", "gray")
+        # For each tree, connect to its blobs
+        for th, blob_hashes in repo_obj.tree_to_blobs.items():
             try:
-                tree_obj = git_repo.get_tree(tree_hash)
+                tobj = repo_obj.get_tree(th)
             except Exception as e:
-                logging.error("Skipping tree %s: %s", tree_hash, e)
+                logging.warning("Skipping tree %s: %s", th, e)
                 continue
-            common = tree_obj.name
-            differentiator = tree_obj.hash[:6]
-            full_label = f"{tree_obj.name} {tree_obj.hash[:6]}"
-            node_id = make_node_id(prefix, "tree", common)
+            tree_id = make_node_id(prefix, "tree",
+                                   tobj.name if (config['group_enabled'] and 'tree' in config['group_types']) else th)
+            label = f"{tobj.name} {tobj.hash[:6]}"
             attrs = {'shape': 'triangle'}
             if config['colors']:
                 attrs['color'] = config['colors_map']['tree']
-            nodes_list.append({
-                "id": node_id, "common": common,
-                "differentiator": differentiator,
-                "full_label": full_label, "attrs": attrs
-            })
-        group_tree_sg = create_subgraph(
-            repo_cluster, f"cluster_{prefix}_grouped_trees",
-            label="Trees", color="gray"
-        )
-        draw_grouped_nodes(group_tree_sg, nodes_list, "tree", prefix, config)
-    else:
-        tree_sg = create_subgraph(
-            repo_cluster, f"cluster_{prefix}_trees",
-            label="Trees", color="gray"
-        )
-        # For each tree, draw its node and connect to blobs/subtrees
-        for tree_hash, blob_hashes in git_repo.tree_to_blobs.items():
-            try:
-                tree_obj = git_repo.get_tree(tree_hash)
-            except Exception as e:
-                logging.error("Skipping tree %s due to error: %s", tree_hash, e)
-                continue
-            tree_nid = (make_node_id(prefix, "tree", tree_obj.name) if
-                        (config.get('group_enabled', False) and
-                         'tree' in config.get('group_types', []))
-                        else make_node_id(prefix, "tree", tree_hash))
-            label = f"{tree_obj.name} {tree_obj.hash[:6]}"
-            attrs = {'shape': 'triangle'}
-            if config['colors']:
-                attrs['color'] = config['colors_map']['tree']
-            tree_sg.node(tree_nid, label=label, **attrs)
+            sg.node(tree_id, label=label, **attrs)
 
-            for blob_hash in blob_hashes:
+            for blob_h in blob_hashes:
+                blob_id = make_node_id(prefix, "blob", blob_h)
+                ekey = (tree_id, blob_id)
+                if ekey not in drawn_edges:
+                    sg.edge(tree_id, blob_id, minlen='2')
+                    drawn_edges.add(ekey)
+
+        # For each tree, connect to its subtrees
+        for th, subtree_hashes in repo_obj.tree_to_trees.items():
+            try:
+                tobj = repo_obj.get_tree(th)
+            except Exception as e:
+                logging.warning("Skipping tree %s: %s", th, e)
+                continue
+            tree_id = make_node_id(prefix, "tree",
+                                   tobj.name if (config['group_enabled'] and 'tree' in config['group_types']) else th)
+            label = f"{tobj.name} {tobj.hash[:6]}"
+            attrs = {'shape': 'triangle'}
+            if config['colors']:
+                attrs['color'] = config['colors_map']['tree']
+            sg.node(tree_id, label=label, **attrs)
+
+            for sub_h in subtree_hashes:
                 try:
-                    blob = git_repo.blobs[blob_hash]
-                except KeyError:
-                    logging.warning("Blob %s not found in cache", blob_hash)
-                    continue
-                blob_nid = make_node_id(prefix, "blob", blob_hash)
-                tree_sg.edge(tree_nid, blob_nid, minlen='2', constraint='true')
-
-        for tree_hash, subtree_hashes in git_repo.tree_to_trees.items():
-            try:
-                tree_obj = git_repo.get_tree(tree_hash)
-            except Exception as e:
-                logging.error("Skipping tree %s: %s", tree_hash, e)
-                continue
-            tree_nid = (make_node_id(prefix, "tree", tree_obj.name) if
-                        (config.get('group_enabled', False) and
-                         'tree' in config.get('group_types', []))
-                        else make_node_id(prefix, "tree", tree_hash))
-            label = f"{tree_obj.name} {tree_obj.hash[:6]}"
-            attrs = {'shape': 'triangle'}
-            if config['colors']:
-                attrs['color'] = config['colors_map']['tree']
-            tree_sg.node(tree_nid, label=label, **attrs)
-
-            for subtree_hash in subtree_hashes:
-                try:
-                    subtree_obj = git_repo.get_tree(subtree_hash)
+                    subtobj = repo_obj.get_tree(sub_h)
                 except Exception as e:
-                    logging.error("Skipping subtree %s: %s", subtree_hash, e)
+                    logging.warning("Skipping subtree %s: %s", sub_h, e)
                     continue
-                subtree_nid = (make_node_id(prefix, "tree", subtree_obj.name) if
-                               (config.get('group_enabled', False) and
-                                'tree' in config.get('group_types', []))
-                               else make_node_id(prefix, "tree", subtree_hash))
-                subtree_label = f"{subtree_obj.name} {subtree_obj.hash[:6]}"
-                tree_sg.node(subtree_nid, label=subtree_label, **attrs)
-                tree_sg.edge(tree_nid, subtree_nid, minlen='2', constraint='true')
-                    
-    # --- Commits ---
-    commit_sg = create_subgraph(
-        repo_cluster, f"cluster_{prefix}_commits",
-        label="Commits", color="gray"
-    )
-    for commit_hash, tree_hash in git_repo.commit_to_tree.items():
+                subtree_id = make_node_id(prefix, "tree",
+                                          subtobj.name if (config['group_enabled'] and 'tree' in config['group_types']) else sub_h)
+                subtree_label = f"{subtobj.name} {subtobj.hash[:6]}"
+                sg.node(subtree_id, label=subtree_label, **attrs)
+                ekey = (tree_id, subtree_id)
+                if ekey not in drawn_edges:
+                    sg.edge(tree_id, subtree_id, minlen='2')
+                    drawn_edges.add(ekey)
+
+    # -------------- COMMITS --------------
+    commit_sg = create_subgraph(repo_cluster, f"cluster_{prefix}_commits", "Commits", "gray")
+
+    # Build commit nodes and link them to their tree
+    for commit_hash, tree_hash in repo_obj.commit_to_tree.items():
         try:
-            commit_obj = git_repo.get_commit(commit_hash)
+            cobj = repo_obj.get_commit(commit_hash)
         except Exception as e:
             logging.warning("Skipping commit %s: %s", commit_hash, e)
             continue
-        commit_nid = make_node_id(prefix, "commit", commit_hash)
-        label = format_commit_label(commit_obj, git_repo, config)
+        commit_id = make_node_id(prefix, "commit", commit_hash)
+        label = format_commit_label(cobj, repo_obj, config)
         attrs = {'shape': 'rectangle', 'style': 'filled', 'label': label}
         if config['colors']:
             attrs['color'] = config['colors_map']['commit']
-        commit_sg.node(commit_nid, **attrs)
+        commit_sg.node(commit_id, **attrs)
 
-        # Edge to its tree
+        # Edge commit -> tree
         try:
-            tree_obj = git_repo.get_tree(tree_hash)
-            tree_nid = (make_node_id(prefix, "tree", tree_obj.name) if
-                        (config.get('group_enabled', False) and
-                         'tree' in config.get('group_types', []))
-                        else make_node_id(prefix, "tree", tree_hash))
-            edge_key = (commit_nid, tree_nid)
-            if edge_key not in drawn_edges:
-                commit_sg.edge(commit_nid, tree_nid, minlen='2')
-                drawn_edges.add(edge_key)
+            tobj = repo_obj.get_tree(tree_hash)
+            tree_id = make_node_id(prefix, "tree",
+                                   tobj.name if (config['group_enabled'] and 'tree' in config['group_types']) else tree_hash)
+            ekey = (commit_id, tree_id)
+            if ekey not in drawn_edges:
+                commit_sg.edge(commit_id, tree_id, minlen='2')
+                drawn_edges.add(ekey)
         except Exception as e:
-            logging.warning("Error linking commit %s to tree %s: %s",
-                            commit_hash, tree_hash, e)
+            logging.warning("Could not link commit %s to tree %s: %s", commit_hash, tree_hash, e)
 
-    # Commit parent edges
-    for commit_hash in git_repo.commit_to_tree.keys():
-        try:
-            commit_obj = git_repo.get_commit(commit_hash)
-        except Exception:
-            continue
+    # For parent edges (commit -> parent)
+    limit_parents = config.get('predecessor_limit')
+    for commit_hash, parents in repo_obj.commit_to_parents.items():
+        commit_id = make_node_id(prefix, "commit", commit_hash)
+        parent_list = list(parents)
+        normal_parents = parent_list if limit_parents is None else parent_list[:limit_parents]
+        extra_parents = [] if limit_parents is None else parent_list[limit_parents:]
+        for p in normal_parents:
+            pid = make_node_id(prefix, "commit", p)
+            ekey = (commit_id, pid)
+            if ekey not in drawn_edges:
+                commit_sg.edge(commit_id, pid, minlen='2')
+                drawn_edges.add(ekey)
+        # Dotted for extras
+        for p in extra_parents:
+            pid = make_node_id(prefix, "commit", p)
+            ekey = (commit_id, pid)
+            if ekey not in drawn_edges:
+                commit_sg.edge(commit_id, pid, style='dotted', minlen='2')
+                drawn_edges.add(ekey)
 
-        if not commit_obj.parents:
-            continue
+    # For child edges (commit -> children), if we want forward edges
+    limit_children = config.get('successor_limit')
+    for parent_hash, children in repo_obj.commit_to_children.items():
+        parent_id = make_node_id(prefix, "commit", parent_hash)
+        child_list = list(children)
+        normal_children = child_list if limit_children is None else child_list[:limit_children]
+        extra_children = [] if limit_children is None else child_list[limit_children:]
+        for ch in normal_children:
+            cid = make_node_id(prefix, "commit", ch)
+            ekey = (parent_id, cid)
+            if ekey not in drawn_edges:
+                commit_sg.edge(parent_id, cid, minlen='2')
+                drawn_edges.add(ekey)
+        for ch in extra_children:
+            cid = make_node_id(prefix, "commit", ch)
+            ekey = (parent_id, cid)
+            if ekey not in drawn_edges:
+                commit_sg.edge(parent_id, cid, style='dotted', minlen='2')
+                drawn_edges.add(ekey)
 
-        commit_nid = make_node_id(prefix, "commit", commit_hash)
-        limit = config['predecessor_limit']
-        normal_preds = commit_obj.parents if (limit is None) else commit_obj.parents[:limit]
-        extra_preds = [] if (limit is None) else commit_obj.parents[limit:]
-        for parent in normal_preds:
-            parent_nid = make_node_id(prefix, "commit", parent)
-            edge_key = (commit_nid, parent_nid)
-            if edge_key not in drawn_edges:
-                commit_sg.edge(commit_nid, parent_nid, minlen='2')
-                drawn_edges.add(edge_key)
-
-        for parent in extra_preds:
-            parent_nid = make_node_id(prefix, "commit", parent)
-            edge_key = (commit_nid, parent_nid)
-            if edge_key not in drawn_edges:
-                commit_sg.edge(commit_nid, parent_nid, style='dotted', minlen='2')
-                drawn_edges.add(edge_key)
-
-    # Commit child edges
-    for commit_hash, children in git_repo.commit_to_children.items():
-        commit_nid = make_node_id(prefix, "commit", commit_hash)
-        children_list = list(children)
-        limit = config['successor_limit']
-        normal_children = children_list if (limit is None) else children_list[:limit]
-        extra_children = [] if (limit is None) else children_list[limit:]
-        for child in normal_children:
-            child_nid = make_node_id(prefix, "commit", child)
-            edge_key = (commit_nid, child_nid)
-            if edge_key not in drawn_edges:
-                commit_sg.edge(commit_nid, child_nid, minlen='2')
-                drawn_edges.add(edge_key)
-        for child in extra_children:
-            child_nid = make_node_id(prefix, "commit", child)
-            edge_key = (commit_nid, child_nid)
-            if edge_key not in drawn_edges:
-                commit_sg.edge(commit_nid, child_nid, style='dotted', minlen='2')
-                drawn_edges.add(edge_key)
-                    
-    # --- Branches ---
-    branch_sg = create_subgraph(
-        repo_cluster, f"cluster_{prefix}_branches",
-        label="Branches", color="gray"
-    )
-    for branch_name, commit_hash in git_repo.branch_to_commit.items():
-        branch_nid = make_node_id(prefix, "branch", branch_name)
+    # -------------- BRANCHES --------------
+    branch_sg = create_subgraph(repo_cluster, f"cluster_{prefix}_branches", "Branches", "gray")
+    for branch_name, commit_hash in repo_obj.branch_to_commit.items():
+        branch_id = make_node_id(prefix, "branch", branch_name)
         attrs = {'shape': 'parallelogram'}
         if config['colors']:
             attrs['color'] = config['colors_map']['branch']
-        branch_sg.node(branch_nid, label=branch_name, **attrs)
+        branch_sg.node(branch_id, label=branch_name, **attrs)
 
-        # dotted or solid edges for local/remote branches
+        # Decide edge style
         style = 'solid'
-        # If slash in name => likely remote
-        is_remote = ('/' in branch_name)
-        if (is_remote and ('remote' in config['dotted'] or 'all' in config['dotted'])) \
-           or (not is_remote and ('local' in config['dotted'] or 'all' in config['dotted'])):
+        is_remote = ('/' in branch_name)  # naive: slash => remote
+        dotted_groups = config['dotted']  # e.g. ['remote','local']
+        if (is_remote and ('remote' in dotted_groups or 'all' in dotted_groups)) \
+           or (not is_remote and ('local' in dotted_groups or 'all' in dotted_groups)):
             style = 'dotted'
 
-        commit_nid = make_node_id(prefix, "commit", commit_hash)
-        branch_sg.edge(branch_nid, commit_nid, style=style, minlen='2')
-        
-    # --- Legend (optional) ---
-    if config['colors']:
-        legend = create_subgraph(
-            repo_cluster, f"cluster_{prefix}_legend",
-            label="Legend", color="black"
-        )
-        for nodetype, col in config['colors_map'].items():
-            node_id = f"legend_{nodetype}"
-            legend.node(node_id, label=nodetype.capitalize(),
-                        shape='box', style='filled', color=col)
+        commit_id = make_node_id(prefix, "commit", commit_hash)
+        ekey = (branch_id, commit_id)
+        if ekey not in drawn_edges:
+            branch_sg.edge(branch_id, commit_id, style=style, minlen='2')
+            drawn_edges.add(ekey)
 
-# --- Combined Repository Base Mode ---
+    # -------------- LEGEND --------------
+    if config['colors']:
+        legend = create_subgraph(repo_cluster, f"cluster_{prefix}_legend", "Legend", "black")
+        for nodetype, color in config['colors_map'].items():
+            legend.node(f"legend_{prefix}_{nodetype}",
+                        label=nodetype.capitalize(),
+                        shape='box',
+                        style='filled',
+                        color=color)
+
+# -------------------------------------------------------------------
+#                COMBINED REPO MODE ( --repo-base )
+# -------------------------------------------------------------------
+
 def generate_combined_repo_graph(repo_base_path: str, config: dict) -> None:
     """
-    Recursively scan repo_base_path for Git repositories (directories with a .git folder)
-    and generate one PDF document containing:
-      1. A cluster for the overall project directory structure.
-      2. A cluster for all detected Git repositories (each added as a subgraph).
+    Recursively search for .git directories and create one PDF with:
+      - A "project structure" subgraph
+      - Subgraphs for each discovered repo
     """
-    abs_repo_base = os.path.abspath(repo_base_path)
-    if abs_repo_base in ['/', os.path.sep]:
-        logging.error("Refusing to scan system root '%s'", abs_repo_base)
+    abs_base = os.path.abspath(repo_base_path)
+    if abs_base in ['/', os.path.sep]:
+        logging.error("Refusing to scan system root '%s'", abs_base)
         sys.exit(1)
-    logging.info("Scanning for Git repositories under '%s'", repo_base_path)
-    git_repos = []
-    for root, dirs, _ in os.walk(repo_base_path, topdown=True, followlinks=False):
-        # Skip directories that are outside the base path
-        if os.path.abspath(root) != abs_repo_base and \
-           not os.path.commonpath([abs_repo_base, os.path.abspath(root)]) == abs_repo_base:
-            continue
 
+    logging.info("Scanning for Git repos under '%s'", abs_base)
+    found_repos = []
+    for root, dirs, files in os.walk(abs_base, topdown=True, followlinks=False):
+        # skip if root is outside of base (should not happen in normal os.walk)
+        if not os.path.commonpath([abs_base, os.path.abspath(root)]) == abs_base:
+            continue
         if '.git' in dirs:
-            repo_abs = os.path.join(root)
-            rel_path = os.path.relpath(repo_abs, repo_base_path)
-            git_repos.append((repo_abs, rel_path))
-            # do not descend further into repos
+            found_repos.append(root)
+            # do not descend further
             dirs[:] = []
 
-    if not git_repos:
-        logging.error("No Git repositories found under '%s'", repo_base_path)
+    if not found_repos:
+        logging.error("No Git repos found under '%s'", abs_base)
         sys.exit(1)
-    logging.info("Found %d Git repositories.", len(git_repos))
 
-    master = Digraph(comment='Combined Repository Graph', format='pdf')
+    master = Digraph(comment="Combined Repository Graph", format='pdf')
     master.attr(compound='true', splines='true', overlap='false')
 
-    # Project structure cluster
-    proj_cluster = create_subgraph(
-        master, "cluster_project_structure",
-        label="Project Structure", color="black"
-    )
-    node_counter = [0]
+    # 1) Add the directory structure cluster
+    proj_cluster = create_subgraph(master, "cluster_project_structure", "Project Structure", "black")
 
-    def process_directory(dir_path: str, parent_id: str = None,
-                          depth: int = 0,
-                          max_depth: int = config.get('max_depth', 10)):
+    node_id_counter = [0]
+
+    def walk_dir(path: str, parent: str = None, depth: int = 0, maxd: int = config.get('max_depth', 10)):
+        if depth > maxd:
+            return
         try:
-            entries = os.listdir(dir_path)
+            items = os.listdir(path)
         except Exception as e:
-            logging.error("Cannot list directory '%s': %s", dir_path, e)
+            logging.warning("Cannot list directory '%s': %s", path, e)
             return
-
-        if depth > max_depth:
-            return
-
-        current_id = sanitize_id(os.path.abspath(dir_path))
-        label = os.path.basename(dir_path) if os.path.basename(dir_path) else dir_path
-        proj_cluster.node(current_id, label=label, shape='folder',
-                          style='filled', color='lightblue')
-        if parent_id:
-            proj_cluster.edge(parent_id, current_id)
-
-        for entry in sorted(entries):
-            full_path = os.path.join(dir_path, entry)
-            if not os.path.abspath(full_path).startswith(abs_repo_base):
-                continue
-            if os.path.isdir(full_path):
-                process_directory(full_path, current_id, depth + 1, max_depth)
+        label = os.path.basename(path) or path
+        this_id = sanitize_id(os.path.abspath(path))
+        proj_cluster.node(this_id, label=label, shape='folder', style='filled', color='lightblue')
+        if parent:
+            proj_cluster.edge(parent, this_id)
+        for it in sorted(items):
+            fullp = os.path.join(path, it)
+            if os.path.isdir(fullp):
+                walk_dir(fullp, this_id, depth+1, maxd)
             else:
-                file_id = sanitize_id(os.path.abspath(full_path)) + f"_{node_counter[0]}"
-                node_counter[0] += 1
-                proj_cluster.node(file_id, label=entry, shape='note',
-                                  style='filled', color='lightyellow')
-                proj_cluster.edge(current_id, file_id)
+                # file
+                fid = sanitize_id(os.path.abspath(fullp)) + "_" + str(node_id_counter[0])
+                node_id_counter[0] += 1
+                proj_cluster.node(fid, label=it, shape='note', style='filled', color='lightyellow')
+                proj_cluster.edge(this_id, fid)
 
-    process_directory(repo_base_path)
+    walk_dir(abs_base)
 
-    # Git repositories cluster
-    repos_cluster = create_subgraph(
-        master, "cluster_git_repos",
-        label="Git Repositories", color="blue"
-    )
-    for idx, (repo_abs, rel_path) in enumerate(git_repos):
-        prefix = f"repo{idx}_{sanitize_id(rel_path)}"
-        logging.info("Processing repository at '%s' (relative: '%s')", repo_abs, rel_path)
+    # 2) Add the "Git Repositories" cluster
+    repos_cluster = create_subgraph(master, "cluster_git_repos", "Git Repositories", "blue")
+    for idx, rdir in enumerate(found_repos):
+        relp = os.path.relpath(rdir, abs_base)
+        prefix = f"repo{idx}_{sanitize_id(relp)}"
+        logging.info("Processing repo: %s (relative: %s)", rdir, relp)
         try:
-            repo_obj = GitRepo(repo_abs, local_only=config['local_only'])
+            repo_obj = GitRepo(rdir, local_only=config['local_only'])
             repo_obj.parse_dot_git_dir()
         except Exception as e:
-            logging.error("Error processing repository '%s': %s", repo_abs, e)
+            logging.error("Error loading repo '%s': %s", rdir, e)
             continue
-        add_git_repo_subgraph(repos_cluster, repo_obj, config, prefix, repo_label=rel_path)
+        add_git_repo_subgraph(repos_cluster, repo_obj, config, prefix, repo_label=relp)
 
+    # Render
+    outfile = 'combined_repo.gv'
     try:
-        output_file = 'combined_repo.gv'
-        logging.info("Rendering combined graph to file '%s.pdf'", output_file)
+        logging.info("Rendering combined graph to %s.pdf", outfile)
         logging.debug("Graph source:\n%s", master.source)
-        master.render(output_file, view=(not config['output_only']))
+        master.render(outfile, view=(not config['output_only']))
     except Exception as e:
-        logging.error("Error rendering combined graph: %s", e)
+        logging.error("Error rendering combined repo graph: %s", e)
         sys.exit(1)
 
-# --- Graph Generation for Single Repository Mode ---
+# -------------------------------------------------------------------
+#          SIMPLE CLASS TO GENERATE SINGLE-REPO GRAPH
+# -------------------------------------------------------------------
+
 class GraphGenerator:
     def __init__(self, config: dict):
         self.config = config
 
-    def generate_graph(self, git_repo) -> None:
-        logging.info("Generating Git object graph (single repository mode)")
+    def generate_graph(self, repo_obj) -> None:
+        """
+        Generate a PDF named 'git.gv.pdf' for a single repository object.
+        """
         master = Digraph(comment='Git graph', format='pdf')
         master.attr(compound='true', splines='true', overlap='false')
-        try:
-            add_git_repo_subgraph(master, git_repo, self.config,
-                                  prefix="single", repo_label="Repository")
-        except Exception as e:
-            logging.error("Error generating subgraph for repository: %s", e)
-            sys.exit(1)
 
         try:
-            output_file = 'git.gv'
-            logging.info("Rendering graph to file '%s.pdf'", output_file)
+            add_git_repo_subgraph(master, repo_obj, self.config,
+                                  prefix="single", repo_label="Repository")
+        except Exception as e:
+            logging.error("Error building subgraph: %s", e)
+            sys.exit(1)
+
+        outname = 'git.gv'
+        try:
+            logging.info("Rendering graph to '%s.pdf'", outname)
             logging.debug("Graph source:\n%s", master.source)
-            master.render(output_file, view=(not self.config['output_only']))
+            master.render(outname, view=(not self.config['output_only']))
         except Exception as e:
             logging.error("Error rendering graph: %s", e)
             sys.exit(1)
 
-# --- Utility Functions ---
+# -------------------------------------------------------------------
+#                       CLI / MAIN
+# -------------------------------------------------------------------
+
 def check_dependencies() -> None:
+    """Ensure 'dot' is in PATH."""
     if not shutil.which('dot'):
-        logging.error('Command "dot" was not found. Please install Graphviz.')
+        logging.error('Graphviz "dot" command not found. Please install Graphviz.')
         sys.exit(1)
 
 def get_git_repo_path(path: str) -> str:
+    """Validate 'path' is a directory with .git inside."""
     if not os.path.isdir(path):
-        logging.error("Invalid git repo path: '%s'", path)
+        logging.error("Invalid path for repository: '%s'", path)
         sys.exit(1)
-    dot_git_dir = os.path.join(path, '.git')
-    if not os.path.isdir(dot_git_dir):
+    dotgit = os.path.join(path, '.git')
+    if not os.path.isdir(dotgit):
         logging.error("No .git directory found in '%s'", path)
         sys.exit(1)
     return path
 
 def parse_arguments() -> dict:
     parser = argparse.ArgumentParser(
-        description='Generate a Graphviz diagram of a Git repository or a combined view of multiple repos.\n\n'
-                    'Examples:\n'
-                    '  python3 git-graph.py --colors -o --local -P 1 -S 2 --dotted remote -M author,flags,short\n'
-                    '  python3 git-graph.py --repo-base /path/to/project --colors --group --group-types blob,tree --verbose\n'
-                    '  python3 git-graph.py --dump\n'
-                    '  python3 git-graph.py --read-dump my_dump.json',
-        formatter_class=argparse.RawTextHelpFormatter
+        description="Generate a Graphviz diagram of a Git repository (single or combined), "
+                    "or dump the repo structure to a JSON file.",
+        formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument('path', nargs='?', default=os.getcwd(),
-                        help='Path to the Git repository (default: current directory)')
+                        help='Path to the Git repo (default current dir).')
     parser.add_argument('--colors', action='store_true',
-                        help='Enable unique colors for nodes and add a legend')
+                        help='Enable distinct colors for nodes plus a legend.')
     parser.add_argument('-o', '--output-only', action='store_true',
-                        help='Save the output to file only without opening the viewer')
+                        help='Save .pdf but do not open in viewer.')
     parser.add_argument('--local', action='store_true',
-                        help='Display only local branches (skip remote branches)')
+                        help='Show only local branches (skip remotes).')
     parser.add_argument('-P', '--predecessors', type=int, default=None,
-                        help='Maximum number of predecessor (parent) edges to show normally per commit\n'
-                             '(extra edges will be drawn dotted)')
+                        help='Max parents per commit (others dotted).')
     parser.add_argument('-S', '--successors', type=int, default=None,
-                        help='Maximum number of successor (child) edges to show normally per commit\n'
-                             '(extra edges will be drawn dotted)')
-    parser.add_argument('--dotted', nargs='*', choices=['remote', 'local', 'all'], default=[],
-                        help='Force the given group(s) of branch edges to be drawn in dotted style.\n'
-                             'Choices: remote, local, all')
+                        help='Max children per commit (others dotted).')
+    parser.add_argument('--dotted', nargs='*', choices=['remote','local','all'], default=[],
+                        help='Draw edges from these branch types in dotted style.')
     parser.add_argument('-M', '--metadata', type=str, default='all',
-                        help='Comma-separated list of metadata keys to include in commit node labels.\n'
-                             'Available keys: flags, author, short, gitstat. Default: all')
+                        help='Comma-separated metadata for commits: e.g. author,flags,gitstat. Default=all')
     parser.add_argument('--group', action='store_true',
-                        help='Enable multi-level grouping of nodes with similar labels')
+                        help='Enable grouping nodes with similar labels.')
     parser.add_argument('--group-types', type=str, default='blob,tree',
-                        help='Comma-separated list of node types to group (options: blob, tree, commit, branch). Default: blob,tree')
+                        help='Node types to group: blob,tree,commit,branch (comma-separated).')
     parser.add_argument('--group-condense-level', type=int, default=1,
-                        help='Level of visual condensation for grouped nodes (higher means more condensed; default: 1)')
+                        help='Condensation of grouped nodes. Default=1')
     parser.add_argument('--repo-base', type=str,
-                        help='Path to the repository base folder to generate a combined diagram of all Git repos found')
+                        help='If given, scan for multiple repos within that folder, generate combined PDF.')
     parser.add_argument('--max-depth', type=int, default=10,
-                        help='Maximum depth when scanning directories in repo-base mode (default: 10)')
+                        help='Directory traversal depth (repo-base mode).')
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--dump', action='store_true',
-                       help='Generate a JSON dump of the repository data (instead of a graph)')
+                       help='Dump repository data to JSON, do not generate PDF.')
     group.add_argument('--read-dump', type=str,
-                       help='Read repository dump from file and generate a graph')
-    parser.add_argument('--dump-file', type=str, default="git_repo_dump.json",
-                        help='Filename for dump output (used with --dump)')
+                       help='Read data from a previously created JSON and generate a PDF.')
+    parser.add_argument('--dump-file', type=str, default='git_repo_dump.json',
+                        help='Where to write or read JSON dump (default git_repo_dump.json).')
     parser.add_argument('--verbose', action='store_true',
-                        help='Enable verbose output')
+                        help='Enable verbose logging.')
+
     args = parser.parse_args()
 
-    meta = args.metadata.strip()
-    if meta != "all":
-        meta = {m.strip() for m in meta.split(',')}
+    # Build config
+    meta_val = args.metadata.strip()
+    if meta_val != "all":
+        meta_val = {m.strip().lower() for m in meta_val.split(',')}
 
-    config = {
+    cfg = {
         'colors': args.colors,
         'output_only': args.output_only,
+        'local_only': args.local,
         'predecessor_limit': args.predecessors,
         'successor_limit': args.successors,
         'dotted': args.dotted,
-        'metadata': meta,
-        'local_only': args.local,
+        'metadata': meta_val,
+        'group_enabled': args.group,
+        'group_types': [t.strip().lower() for t in args.group_types.split(',')] if args.group_types else [],
+        'group_condense_level': args.group_condense_level,
+        'max_depth': args.max_depth,
         'colors_map': {
             'blob': 'lightyellow',
             'tree': 'lightgreen',
             'commit': 'lightblue',
             'branch': 'orange'
-        },
-        'group_enabled': args.group,
-        'group_types': [x.strip().lower() for x in args.group_types.split(',')] if args.group_types else [],
-        'group_condense_level': args.group_condense_level,
-        'max_depth': args.max_depth
+        }
     }
     return {
         'repo_path': args.path,
-        'config': config,
         'repo_base': args.repo_base,
         'dump': args.dump,
-        'dump_file': args.dump_file,
         'read_dump': args.read_dump,
-        'verbose': args.verbose
+        'dump_file': args.dump_file,
+        'verbose': args.verbose,
+        'config': cfg
     }
 
 def main() -> None:
+    # Parse
     args = parse_arguments()
-    log_level = logging.DEBUG if args['verbose'] else logging.INFO
-    logging.basicConfig(level=log_level, format='%(levelname)s: %(message)s')
+    # Set up logging
+    loglevel = logging.DEBUG if args['verbose'] else logging.INFO
+    logging.basicConfig(level=loglevel, format="%(levelname)s: %(message)s")
+
+    # Check for 'dot'
     check_dependencies()
 
+    # Decide mode
     try:
         if args['dump']:
-            # Dump mode
+            # Dump the single repo data
             repo_path = get_git_repo_path(args['repo_path'])
-            git_repo = GitRepo(repo_path, local_only=args['config']['local_only'])
-            git_repo.parse_dot_git_dir()
-            dump_git_repo(git_repo, args['dump_file'])
+            repo = GitRepo(repo_path, local_only=args['config']['local_only'])
+            repo.parse_dot_git_dir()
+            dump_git_repo(repo, args['dump_file'])
+
         elif args['read_dump']:
-            # Read a dump file and generate a graph
-            dumped_repo = load_git_repo_dump(args['read_dump'])
-            GraphGenerator(args['config']).generate_graph(dumped_repo)
+            # Load from JSON, then graph
+            dr = load_git_repo_dump(args['read_dump'])
+            GraphGenerator(args['config']).generate_graph(dr)
+
         elif args['repo_base']:
-            # Combined multi-repo mode
-            if not os.path.isdir(args['repo_base']):
-                logging.error("Invalid repository base path: '%s'", args['repo_base'])
+            # Combined multi-repo
+            base = os.path.abspath(args['repo_base'])
+            if not os.path.isdir(base):
+                logging.error("Invalid --repo-base: '%s'", base)
                 sys.exit(1)
-            generate_combined_repo_graph(args['repo_base'], args['config'])
+            generate_combined_repo_graph(base, args['config'])
+
         else:
-            # Single-repo graph mode
+            # Single repo graph
             repo_path = get_git_repo_path(args['repo_path'])
-            git_repo = GitRepo(repo_path, local_only=args['config']['local_only'])
-            git_repo.parse_dot_git_dir()
-            GraphGenerator(args['config']).generate_graph(git_repo)
+            repo = GitRepo(repo_path, local_only=args['config']['local_only'])
+            repo.parse_dot_git_dir()
+            GraphGenerator(args['config']).generate_graph(repo)
+
     except Exception as e:
-        logging.exception("An unrecoverable error occurred: %s", e)
+        logging.exception("Unhandled error: %s", e)
         sys.exit(1)
 
 if __name__ == '__main__':
