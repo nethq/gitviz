@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-Git Graph Visualizer with Multi–Level Visual Grouping, Dump/Read–Dump,
-and Enhanced Metadata for Static (PDF) and Interactive (HTML) Visualization.
+Git Graph Visualizer with Multi–Level Visual Grouping, Dump/Read‐Dump,
+and Dual PDF Engines plus Enhanced Interactive Visualization.
 
 Version: 99.102
 
 Modes:
-  1) Single–repo mode (default): generates a static PDF via Graphviz.
-  2) Combined repository mode (--repo-base): scans a base folder for repos and produces one PDF.
-  3) Dump mode (--dump) and Read-dump mode (--read-dump): JSON serialization.
-  4) Interactive mode (--interactive): generates an HTML file with a clickable, explorable graph.
-
-Requirements:
-  - Python 3.x
-  - pip install graphviz
-  - Graphviz “dot” in PATH (for PDF generation)
-  - For interactive mode, the output HTML uses vis‑network loaded from a CDN.
+  1) Single–repo mode (default) generates a static PDF using a new NetworkX/matplotlib engine (by default)
+     ––pdf-engine can be set to “graphviz” to use the old method.
+  2) Combined repository mode (--repo-base) scans a base folder for repos and produces one combined diagram.
+  3) Dump mode (--dump) and Read-dump mode (--read-dump) produce/load a JSON representation so that visualization
+     needs only the dump.
+  4) Interactive mode (--interactive) produces an HTML file using vis-network.
   
+For interactive mode, the layout is hierarchical with a direction determined by --layout-orientation
+("vertical" → 'UD', "horizontal" → 'LR'). The static PDF (NetworkX engine) also “squashes” the non‐dominant axis.
+
 Usage examples:
   python3 git_graph.py /path/to/repo
   python3 git_graph.py --interactive /path/to/repo
@@ -52,15 +51,15 @@ Hash   = str
 # ---------------------- HELPER FUNCTIONS -------------------------
 
 def sanitize_id(s: str) -> str:
-    """Sanitize a string for use as a Graphviz or data node ID."""
+    """Sanitize a string for use as a node ID."""
     return re.sub(r'\W+', '_', s)
 
 def make_node_id(prefix: str, typ: str, identifier: str) -> str:
-    """Create a canonical node ID, e.g. prefix_commit_abcd."""
+    """Generate a namespaced node ID."""
     return f"{prefix}_{typ}_{sanitize_id(identifier)}"
 
 def get_distinct_color(index: int, total: int) -> str:
-    """Return a distinct hex color based on index/total using HLS."""
+    """Generate a distinct hex color based on HLS."""
     if total <= 0:
         total = 1
     hue = (index / total) % 1.0
@@ -68,7 +67,7 @@ def get_distinct_color(index: int, total: int) -> str:
     return '#{:02x}{:02x}{:02x}'.format(int(r*255), int(g*255), int(b*255))
 
 def create_subgraph(parent: Digraph, name: str, label: str = None, color: str = None) -> Digraph:
-    """Create and return a new subgraph inside parent."""
+    """Helper to create a subgraph in Graphviz."""
     sub = parent.subgraph(name=name)
     if hasattr(sub, '__enter__'):
         sub = sub.__enter__()
@@ -81,8 +80,7 @@ def create_subgraph(parent: Digraph, name: str, label: str = None, color: str = 
 def draw_grouped_nodes(subgraph: Digraph, nodes: List[dict], node_type: str,
                        prefix: str, config: dict) -> None:
     """
-    Group nodes by their common label; if a group has multiple entries,
-    draw a single record–shaped node with all differentiators.
+    Group nodes by their “common” value; if multiple, draw as a record‐shaped node.
     """
     groups = defaultdict(list)
     for node in nodes:
@@ -111,32 +109,27 @@ def draw_grouped_nodes(subgraph: Digraph, nodes: List[dict], node_type: str,
 
 def format_commit_label(commit, repo_obj, config: dict) -> str:
     """
-    Build a label for a commit node showing short hash, author, branch flags and stats.
-    (This is used for the Graphviz label.)
+    Build a concise label for a commit node.
     """
     label = f"{commit.hash[:7]}"
     meta = config['metadata']
     def want(key: str) -> bool:
         return meta == 'all' or (isinstance(meta, set) and key in meta)
     if want("author"):
-        label += f"\nAuthor: {commit.author}"
+        label += f"\n{commit.author}"
     if want("flags"):
         branches = repo_obj.commit_to_branches.get(commit.hash, [])
         if branches:
-            label += f"\nBranches: {', '.join(branches)}"
+            label += f"\n{' '.join('R' if '/' in b else 'L' for b in branches)}"
     if want("gitstat"):
         stat = repo_obj.get_git_stat(commit.hash)
         if stat:
-            label += f"\nStats: {stat.strip()}"
+            label += f"\n{stat.strip()}"
     return label
 
 def format_commit_tooltip(commit, repo_obj, config: dict) -> str:
-    """
-    Build an extended tooltip for a commit node with full metadata.
-    (This string will be used in the Graphviz tooltip attribute and in interactive mode.)
-    """
-    tooltip = f"Commit: {commit.hash}\n"
-    tooltip += f"Author: {commit.author}\n"
+    """Return an extended tooltip for a commit node."""
+    tooltip = f"Commit: {commit.hash}\nAuthor: {commit.author}\n"
     branches = repo_obj.commit_to_branches.get(commit.hash, [])
     if branches:
         tooltip += f"Branches: {', '.join(branches)}\n"
@@ -147,18 +140,18 @@ def format_commit_tooltip(commit, repo_obj, config: dict) -> str:
     return tooltip
 
 def format_tree_tooltip(tobj: Tree) -> str:
-    """Return a tooltip string for a tree node."""
-    return f"Tree: {tobj.name}\nHash: {tobj.hash}\nContains: {len(tobj.trees)} subtrees, {len(tobj.blobs)} blobs"
+    """Return a tooltip for a tree node."""
+    return f"Tree: {tobj.name}\nHash: {tobj.hash}\nSubtrees: {len(tobj.trees)}, Blobs: {len(tobj.blobs)}"
 
 def format_blob_tooltip(blob: Blob) -> str:
-    """Return a tooltip string for a blob node."""
+    """Return a tooltip for a blob node."""
     return f"Blob: {blob.name}\nHash: {blob.hash}"
 
 # ---------------------- GIT REPO MODEL & PARSER -------------------------
 
 class GitRepo:
     """
-    A parsed Git repository; caches commits, trees, blobs, and reference relationships.
+    Represents a parsed Git repository; caches commits, trees, blobs, and relationships.
     """
     def __init__(self, git_repo_path: str, local_only: bool = False):
         self.git_repo_path = os.path.abspath(git_repo_path)
@@ -181,7 +174,6 @@ class GitRepo:
     def parse_dot_git_dir(self) -> None:
         logging.info("Parsing .git directory at '%s'", self.dot_git_dir)
         self._gather_references()
-
         self.branches.clear()
         for ref_name, commit_hash in self._all_refs.items():
             if not commit_hash:
@@ -197,7 +189,6 @@ class GitRepo:
             self.branches.append(Branch(name=short_name, commit=commit_hash, remote=is_remote))
             self.branch_to_commit[short_name] = commit_hash
             self.commit_to_branches[commit_hash].append(short_name)
-
         if not self.branches:
             head_file = os.path.join(self.dot_git_dir, 'HEAD')
             if os.path.isfile(head_file):
@@ -207,14 +198,12 @@ class GitRepo:
                     self.branches.append(Branch(name='HEAD', commit=head_val, remote=False))
                     self.branch_to_commit['HEAD'] = head_val
                     self.commit_to_branches[head_val].append('HEAD')
-
         visited: Set[Hash] = set()
         for br in self.branches:
             try:
                 self._traverse_history(br.commit, visited)
             except Exception as e:
                 logging.warning("Unable to traverse branch %s: %s", br.name, e)
-
         self._build_commit_children()
 
     def _gather_references(self) -> None:
@@ -481,210 +470,52 @@ def load_git_repo_dump(dump_file: str) -> DumpedRepo:
         sys.exit(1)
 
 # ---------------------- STATIC GRAPH (PDF) GENERATION -------------------------
+# Here we use a new PDF engine based on NetworkX and matplotlib.
 
-def add_git_repo_subgraph(master: Digraph, repo_obj, config: dict,
-                          prefix: str, repo_label: str) -> None:
-    drawn_edges = set()
-    repo_cluster = create_subgraph(master, f"cluster_repo_{sanitize_id(prefix)}", label=repo_label, color='blue')
-
-    # BLOBS
-    if config.get('group_enabled') and 'blob' in config.get('group_types', []):
-        blob_list = []
-        for blob_hash, blob in repo_obj.blobs.items():
-            node_id = make_node_id(prefix, "blob", blob_hash)
-            blob_label = f"{blob.name} ({blob_hash[:6]})"
-            blob_list.append({
-                'id': node_id,
-                'common': blob.name,
-                'differentiator': blob_hash[:6],
-                'full_label': blob_label,
-                'attrs': {'shape': 'ellipse', 'style': 'filled',
-                          'color': config['colors_map']['blob'] if config['colors'] else 'black',
-                          'tooltip': format_blob_tooltip(blob)}
-            })
-        sg = create_subgraph(repo_cluster, f"cluster_{prefix}_grouped_blobs", "Blobs", "gray")
-        draw_grouped_nodes(sg, blob_list, "blob", prefix, config)
-    else:
-        sg = create_subgraph(repo_cluster, f"cluster_{prefix}_blobs", "Blobs", "gray")
-        for blob_hash, blob in repo_obj.blobs.items():
-            node_id = make_node_id(prefix, "blob", blob_hash)
-            label = f"{blob.name} ({blob_hash[:6]})"
-            attrs = {'shape': 'ellipse', 'style': 'filled'}
-            if config['colors']:
-                attrs['color'] = config['colors_map']['blob']
-            attrs['tooltip'] = format_blob_tooltip(blob)
-            sg.node(node_id, label=label, **attrs)
-
-    # TREES
-    if config.get('group_enabled') and 'tree' in config.get('group_types', []):
-        all_tree_hashes = set(repo_obj.tree_to_blobs.keys()) | set(repo_obj.tree_to_trees.keys())
-        tree_nodes = []
-        for th in all_tree_hashes:
-            try:
-                tobj = repo_obj.get_tree(th)
-            except Exception as e:
-                logging.warning("Skipping tree %s: %s", th, e)
-                continue
-            node_id = make_node_id(prefix, "tree", tobj.name)
-            full_label = f"{tobj.name} ({tobj.hash[:6]})"
-            tree_nodes.append({
-                'id': node_id,
-                'common': tobj.name,
-                'differentiator': tobj.hash[:6],
-                'full_label': full_label,
-                'attrs': {'shape': 'triangle',
-                          'color': config['colors_map']['tree'] if config['colors'] else 'black',
-                          'tooltip': format_tree_tooltip(tobj)}
-            })
-        sg = create_subgraph(repo_cluster, f"cluster_{prefix}_grouped_trees", "Trees", "gray")
-        draw_grouped_nodes(sg, tree_nodes, "tree", prefix, config)
-    else:
-        sg = create_subgraph(repo_cluster, f"cluster_{prefix}_trees", "Trees", "gray")
-        for th, blob_hashes in repo_obj.tree_to_blobs.items():
-            try:
-                tobj = repo_obj.get_tree(th)
-            except Exception as e:
-                logging.warning("Skipping tree %s: %s", th, e)
-                continue
-            tree_id = make_node_id(prefix, "tree", tobj.name if (config.get('group_enabled') and 'tree' in config.get('group_types', [])) else th)
-            label = f"{tobj.name} ({tobj.hash[:6]})"
-            attrs = {'shape': 'triangle'}
-            if config['colors']:
-                attrs['color'] = config['colors_map']['tree']
-            attrs['tooltip'] = format_tree_tooltip(tobj)
-            sg.node(tree_id, label=label, **attrs)
-            for blob_h in blob_hashes:
-                blob_id = make_node_id(prefix, "blob", blob_h)
-                ekey = (tree_id, blob_id)
-                if ekey not in drawn_edges:
-                    sg.edge(tree_id, blob_id, minlen='2')
-                    drawn_edges.add(ekey)
-        for th, subtree_hashes in repo_obj.tree_to_trees.items():
-            try:
-                tobj = repo_obj.get_tree(th)
-            except Exception as e:
-                logging.warning("Skipping tree %s: %s", th, e)
-                continue
-            tree_id = make_node_id(prefix, "tree", tobj.name if (config.get('group_enabled') and 'tree' in config.get('group_types', [])) else th)
-            label = f"{tobj.name} ({tobj.hash[:6]})"
-            attrs = {'shape': 'triangle'}
-            if config['colors']:
-                attrs['color'] = config['colors_map']['tree']
-            attrs['tooltip'] = format_tree_tooltip(tobj)
-            sg.node(tree_id, label=label, **attrs)
-            for sub_h in subtree_hashes:
-                try:
-                    subtobj = repo_obj.get_tree(sub_h)
-                except Exception as e:
-                    logging.warning("Skipping subtree %s: %s", sub_h, e)
-                    continue
-                subtree_id = make_node_id(prefix, "tree", subtobj.name if (config.get('group_enabled') and 'tree' in config.get('group_types', [])) else sub_h)
-                subtree_label = f"{subtobj.name} ({subtobj.hash[:6]})"
-                sg.node(subtree_id, label=subtree_label, **attrs)
-                ekey = (tree_id, subtree_id)
-                if ekey not in drawn_edges:
-                    sg.edge(tree_id, subtree_id, minlen='2')
-                    drawn_edges.add(ekey)
-
-    # COMMITS
-    commit_sg = create_subgraph(repo_cluster, f"cluster_{prefix}_commits", "Commits", "gray")
-    for commit_hash, tree_hash in repo_obj.commit_to_tree.items():
-        try:
-            cobj = repo_obj.get_commit(commit_hash)
-        except Exception as e:
-            logging.warning("Skipping commit %s: %s", commit_hash, e)
-            continue
-        commit_id = make_node_id(prefix, "commit", commit_hash)
-        label = format_commit_label(cobj, repo_obj, config)
-        attrs = {'shape': 'rectangle', 'style': 'filled', 'label': label}
-        if config['colors']:
-            attrs['color'] = config['colors_map']['commit']
-        # Add tooltip with extra metadata.
-        attrs['tooltip'] = format_commit_tooltip(cobj, repo_obj, config)
-        commit_sg.node(commit_id, **attrs)
-        try:
-            tobj = repo_obj.get_tree(tree_hash)
-            tree_id = make_node_id(prefix, "tree", tobj.name if (config.get('group_enabled') and 'tree' in config.get('group_types', [])) else tree_hash)
-            ekey = (commit_id, tree_id)
-            if ekey not in drawn_edges:
-                commit_sg.edge(commit_id, tree_id, minlen='2')
-                drawn_edges.add(ekey)
-        except Exception as e:
-            logging.warning("Could not link commit %s to tree %s: %s", commit_hash, tree_hash, e)
-    limit_parents = config.get('predecessor_limit')
-    for commit_hash, parents in repo_obj.commit_to_parents.items():
-        commit_id = make_node_id(prefix, "commit", commit_hash)
-        parent_list = list(parents)
-        normal_parents = parent_list if limit_parents is None else parent_list[:limit_parents]
-        extra_parents = [] if limit_parents is None else parent_list[limit_parents:]
-        for p in normal_parents:
-            pid = make_node_id(prefix, "commit", p)
-            ekey = (commit_id, pid)
-            if ekey not in drawn_edges:
-                commit_sg.edge(commit_id, pid, minlen='2')
-                drawn_edges.add(ekey)
-        for p in extra_parents:
-            pid = make_node_id(prefix, "commit", p)
-            ekey = (commit_id, pid)
-            if ekey not in drawn_edges:
-                commit_sg.edge(commit_id, pid, style='dotted', minlen='2')
-                drawn_edges.add(ekey)
-    limit_children = config.get('successor_limit')
-    for parent_hash, children in repo_obj.commit_to_children.items():
-        parent_id = make_node_id(prefix, "commit", parent_hash)
-        child_list = list(children)
-        normal_children = child_list if limit_children is None else child_list[:limit_children]
-        extra_children = [] if limit_children is None else child_list[limit_children:]
-        for ch in normal_children:
-            cid = make_node_id(prefix, "commit", ch)
-            ekey = (parent_id, cid)
-            if ekey not in drawn_edges:
-                commit_sg.edge(parent_id, cid, minlen='2')
-                drawn_edges.add(ekey)
-        for ch in extra_children:
-            cid = make_node_id(prefix, "commit", ch)
-            ekey = (parent_id, cid)
-            if ekey not in drawn_edges:
-                commit_sg.edge(parent_id, cid, style='dotted', minlen='2')
-                drawn_edges.add(ekey)
-    # BRANCHES
-    branch_sg = create_subgraph(repo_cluster, f"cluster_{prefix}_branches", "Branches", "gray")
-    for branch_name, commit_hash in repo_obj.branch_to_commit.items():
-        branch_id = make_node_id(prefix, "branch", branch_name)
-        attrs = {'shape': 'parallelogram'}
-        if config['colors']:
-            attrs['color'] = config['colors_map']['branch']
-        # For branch nodes, add tooltip with branch details.
-        attrs['tooltip'] = f"Branch: {branch_name}\nPoints to: {commit_hash}"
-        branch_sg.node(branch_id, label=branch_name, **attrs)
-        style = 'solid'
-        if (('/' in branch_name and ('remote' in config['dotted'] or 'all' in config['dotted'])) or
-            ('/' not in branch_name and ('local' in config['dotted'] or 'all' in config['dotted']))):
-            style = 'dotted'
-        commit_id = make_node_id(prefix, "commit", commit_hash)
-        ekey = (branch_id, commit_id)
-        if ekey not in drawn_edges:
-            branch_sg.edge(branch_id, commit_id, style=style, minlen='2')
-            drawn_edges.add(ekey)
-    if config['colors']:
-        legend = create_subgraph(repo_cluster, f"cluster_{prefix}_legend", "Legend", "black")
-        for nodetype, color in config['colors_map'].items():
-            legend.node(f"legend_{prefix}_{nodetype}",
-                        label=nodetype.capitalize(),
-                        shape='box', style='filled', color=color)
+def generate_static_pdf_networkx(repo_obj, config: dict, output_file: str = "git_static.pdf") -> None:
+    try:
+        # Build graph data (same as for interactive)
+        data = build_graph_data(repo_obj, config, prefix="static")
+        import networkx as nx
+        G = nx.DiGraph()
+        for node in data["nodes"]:
+            G.add_node(node["id"], label=node["label"])
+        for edge in data["edges"]:
+            G.add_edge(edge["from"], edge["to"])
+        # Compute layout with spring_layout; fix random seed for reproducibility.
+        pos = nx.spring_layout(G, seed=42)
+        # Adjust positions based on orientation.
+        orient = config.get("layout_orientation", "vertical")
+        if orient == "vertical":
+            for k, v in pos.items():
+                pos[k] = (v[0]*0.2, v[1])
+        elif orient == "horizontal":
+            for k, v in pos.items():
+                pos[k] = (v[0], v[1]*0.2)
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(12, 8))
+        nx.draw_networkx_nodes(G, pos, node_size=500, node_color="lightblue")
+        nx.draw_networkx_labels(G, pos, labels=nx.get_node_attributes(G, "label"), font_size=8)
+        nx.draw_networkx_edges(G, pos, arrows=True, arrowstyle="->", arrowsize=10)
+        plt.axis("off")
+        plt.tight_layout()
+        plt.savefig(output_file, format="pdf")
+        plt.close()
+        logging.info("Static PDF generated and saved to '%s'", output_file)
+    except Exception as e:
+        logging.error("Error generating static PDF with NetworkX: %s", e)
+        sys.exit(1)
 
 # ---------------------- INTERACTIVE VISUALIZATION (HTML) -------------------------
 
 def build_graph_data(repo_obj, config: dict, prefix: str = "interactive") -> Dict[str, List[dict]]:
     """
     Build a dictionary with 'nodes' and 'edges' for interactive visualization.
-    Each node includes a "title" property (with extra metadata) so that
-    a hover shows details.
+    Each node gets a “title” property (for hover tooltips).
     """
     nodes = {}
     edges = []
-
-    def add_node(node_id: str, label: str, group: str, title: Optional[str]=None, color: Optional[str]=None, shape: Optional[str]=None):
+    def add_node(node_id: str, label: str, group: str, title: Optional[str] = None, color: Optional[str] = None, shape: Optional[str] = None):
         if node_id not in nodes:
             n = {"id": node_id, "label": label, "group": group}
             if title:
@@ -694,15 +525,13 @@ def build_graph_data(repo_obj, config: dict, prefix: str = "interactive") -> Dic
             if shape:
                 n["shape"] = shape
             nodes[node_id] = n
-
     # BLOBS
     for blob_hash, blob in repo_obj.blobs.items():
         node_id = make_node_id(prefix, "blob", blob_hash)
         label = f"{blob.name} ({blob_hash[:6]})"
         title = format_blob_tooltip(blob)
         add_node(node_id, label, "blob", title=title,
-                 color=config['colors_map']['blob'] if config['colors'] else None,
-                 shape="ellipse")
+                 color=config["colors_map"]["blob"] if config["colors"] else None, shape="ellipse")
     # TREES
     if hasattr(repo_obj, "get_tree"):
         tree_ids = set()
@@ -721,8 +550,7 @@ def build_graph_data(repo_obj, config: dict, prefix: str = "interactive") -> Dic
             label = f"{tobj.name} ({tobj.hash[:6]})"
             title = format_tree_tooltip(tobj)
             add_node(node_id, label, "tree", title=title,
-                     color=config['colors_map']['tree'] if config['colors'] else None,
-                     shape="triangle")
+                     color=config["colors_map"]["tree"] if config["colors"] else None, shape="triangle")
     # COMMITS
     for commit_hash, tree_hash in repo_obj.commit_to_tree.items():
         try:
@@ -734,16 +562,14 @@ def build_graph_data(repo_obj, config: dict, prefix: str = "interactive") -> Dic
         label = format_commit_label(cobj, repo_obj, config)
         title = format_commit_tooltip(cobj, repo_obj, config)
         add_node(node_id, label, "commit", title=title,
-                 color=config['colors_map']['commit'] if config['colors'] else None,
-                 shape="box")
+                 color=config["colors_map"]["commit"] if config["colors"] else None, shape="box")
     # BRANCHES
     for branch_name, commit_hash in repo_obj.branch_to_commit.items():
         node_id = make_node_id(prefix, "branch", branch_name)
         label = branch_name
         title = f"Branch: {branch_name}\nPoints to: {commit_hash}"
         add_node(node_id, label, "branch", title=title,
-                 color=config['colors_map']['branch'] if config['colors'] else None,
-                 shape="dot")
+                 color=config["colors_map"]["branch"] if config["colors"] else None, shape="dot")
     # EDGES
     # Tree -> Blob
     for tree_hash, blob_hashes in getattr(repo_obj, "tree_to_blobs", {}).items():
@@ -788,8 +614,7 @@ def build_graph_data(repo_obj, config: dict, prefix: str = "interactive") -> Dic
     for branch_name, commit_hash in repo_obj.branch_to_commit.items():
         branch_id = make_node_id(prefix, "branch", branch_name)
         commit_id = make_node_id(prefix, "commit", commit_hash)
-        edge = {"from": branch_id, "to": commit_id}
-        edges.append(edge)
+        edges.append({"from": branch_id, "to": commit_id})
     return {"nodes": list(nodes.values()), "edges": edges}
 
 def generate_interactive_visualization(repo_obj, config: dict,
@@ -799,6 +624,8 @@ def generate_interactive_visualization(repo_obj, config: dict,
                                        view: bool = True) -> None:
     try:
         graph_data = build_graph_data(repo_obj, config, prefix)
+        # Determine hierarchical direction based on config.
+        direction = "UD" if config.get("layout_orientation", "vertical") == "vertical" else "LR"
         html_template = f"""<!doctype html>
 <html>
 <head>
@@ -819,6 +646,13 @@ def generate_interactive_visualization(repo_obj, config: dict,
     const container = document.getElementById('network');
     const data = {json.dumps(graph_data)};
     const options = {{
+      layout: {{
+         hierarchical: {{
+           enabled: true,
+           direction: '{direction}',
+           sortMethod: 'directed'
+         }}
+      }},
       nodes: {{
         shape: 'dot',
         size: 16,
@@ -831,15 +665,20 @@ def generate_interactive_visualization(repo_obj, config: dict,
         width: 2,
         color: 'gray',
         smooth: {{
-          type: 'continuous'
+          type: 'cubicBezier',
+          roundness: 0.4
         }}
       }},
       physics: {{
-        stabilization: false,
-        barnesHut: {{
-          gravitationalConstant: -8000,
-          springConstant: 0.001,
-          springLength: 200
+        hierarchicalRepulsion: {{
+          centralGravity: 0.0,
+          springLength: 100,
+          springConstant: 0.01,
+          nodeDistance: 120,
+          damping: 0.09
+        }},
+        stabilization: {{
+          iterations: 250
         }}
       }},
       interaction: {{
@@ -865,14 +704,48 @@ def generate_interactive_visualization(repo_obj, config: dict,
         logging.error("Error generating interactive visualization: %s", e)
         sys.exit(1)
 
-# ---------------------- STATIC GRAPH (PDF) WRAPPER -------------------------
+# ---------------------- STATIC GRAPH (PDF) ENGINE: NETWORKX -------------------------
+
+def generate_static_pdf_networkx(repo_obj, config: dict, output_file: str = "git_static.pdf") -> None:
+    try:
+        # Build graph data (reuse the same data structure as interactive)
+        data = build_graph_data(repo_obj, config, prefix="static")
+        import networkx as nx
+        G = nx.DiGraph()
+        for node in data["nodes"]:
+            G.add_node(node["id"], label=node["label"])
+        for edge in data["edges"]:
+            G.add_edge(edge["from"], edge["to"])
+        pos = nx.spring_layout(G, seed=42)
+        orient = config.get("layout_orientation", "vertical")
+        if orient == "vertical":
+            for k, v in pos.items():
+                pos[k] = (v[0]*0.2, v[1])
+        elif orient == "horizontal":
+            for k, v in pos.items():
+                pos[k] = (v[0], v[1]*0.2)
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(12, 8))
+        nx.draw_networkx_nodes(G, pos, node_size=500, node_color="lightblue")
+        nx.draw_networkx_labels(G, pos, labels=nx.get_node_attributes(G, "label"), font_size=8)
+        nx.draw_networkx_edges(G, pos, arrows=True, arrowstyle="->", arrowsize=10)
+        plt.axis("off")
+        plt.tight_layout()
+        plt.savefig(output_file, format="pdf")
+        plt.close()
+        logging.info("Static PDF generated (NetworkX engine) and saved to '%s'", output_file)
+    except Exception as e:
+        logging.error("Error generating static PDF with NetworkX: %s", e)
+        sys.exit(1)
+
+# ---------------------- LEGACY STATIC GRAPH (PDF) ENGINE: GRAPHVIZ -------------------------
 
 class GraphGenerator:
     def __init__(self, config: dict):
         self.config = config
 
     def generate_graph(self, repo_obj) -> None:
-        logging.info("Generating static Graphviz PDF for repository.")
+        logging.info("Generating static Graphviz PDF for repository (legacy engine).")
         master = Digraph(comment='Git graph', format='pdf')
         master.attr(compound='true', splines='true', overlap='false')
         try:
@@ -886,7 +759,7 @@ class GraphGenerator:
             logging.debug("Graph source:\n%s", master.source)
             master.render(output_name, view=(not self.config['output_only']))
         except Exception as e:
-            logging.error("Error rendering PDF graph: %s", e)
+            logging.error("Error rendering PDF graph with Graphviz: %s", e)
             sys.exit(1)
 
 # ---------------------- COMBINED REPO MODE -------------------------
@@ -959,8 +832,7 @@ def generate_combined_repo_graph(repo_base_path: str, config: dict) -> None:
 
 def check_dependencies() -> None:
     if not shutil.which('dot'):
-        logging.error('Graphviz "dot" command not found. Please install Graphviz.')
-        sys.exit(1)
+        logging.warning('Graphviz "dot" command not found. (Static PDF via Graphviz may fail.)')
 
 def get_git_repo_path(path: str) -> str:
     if not os.path.isdir(path):
@@ -974,7 +846,7 @@ def get_git_repo_path(path: str) -> str:
 
 def parse_arguments() -> dict:
     parser = argparse.ArgumentParser(
-        description="Generate a Git graph visualization (static PDF via Graphviz or interactive HTML) from a repository or a combined repo base. Also supports dump/read-dump modes.",
+        description="Generate a Git graph visualization (static PDF or interactive HTML) from a repository or a combined repo base.\nSupports dump/read-dump modes as well.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument('path', nargs='?', default=os.getcwd(), help='Path to the Git repository (default: current directory)')
@@ -988,6 +860,7 @@ def parse_arguments() -> dict:
     parser.add_argument('--group', action='store_true', help='Enable grouping nodes with similar labels.')
     parser.add_argument('--group-types', type=str, default='blob,tree', help='Comma-separated node types to group (options: blob,tree,commit,branch).')
     parser.add_argument('--group-condense-level', type=int, default=1, help='Level of condensation for grouped nodes (default: 1).')
+    parser.add_argument('--layout-orientation', type=str, choices=['vertical','horizontal'], default='vertical', help='Orientation for interactive and static layouts (default: vertical).')
     parser.add_argument('--repo-base', type=str, help='If set, scan for multiple repos within this base folder and produce a combined diagram.')
     parser.add_argument('--max-depth', type=int, default=10, help='Maximum directory depth when scanning in repo-base mode (default: 10).')
     group = parser.add_mutually_exclusive_group()
@@ -995,9 +868,9 @@ def parse_arguments() -> dict:
     group.add_argument('--read-dump', type=str, help='Read repository data from JSON dump and visualize.')
     parser.add_argument('--dump-file', type=str, default='git_repo_dump.json', help='Filename for dump output/input (default: git_repo_dump.json).')
     parser.add_argument('--interactive', action='store_true', help='Generate an interactive HTML visualization instead of static PDF.')
+    parser.add_argument('--pdf-engine', type=str, choices=['networkx','graphviz'], default='networkx', help='PDF engine for static visualization (default: networkx).')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose logging.')
     args = parser.parse_args()
-
     meta_val = args.metadata.strip()
     if meta_val != "all":
         meta_val = {m.strip().lower() for m in meta_val.split(',')}
@@ -1013,12 +886,14 @@ def parse_arguments() -> dict:
         'group_types': [t.strip().lower() for t in args.group_types.split(',')] if args.group_types else [],
         'group_condense_level': args.group_condense_level,
         'max_depth': args.max_depth,
+        'layout_orientation': args.layout_orientation,
         'colors_map': {
             'blob': 'lightyellow',
             'tree': 'lightgreen',
             'commit': 'lightblue',
             'branch': 'orange'
-        }
+        },
+        'pdf_engine': args.pdf_engine
     }
     return {
         'repo_path': args.path,
@@ -1047,7 +922,10 @@ def main() -> None:
             if args['interactive']:
                 generate_interactive_visualization(dumped_repo, args['config'], output_file="git_interactive.html", view=(not args['config']['output_only']))
             else:
-                GraphGenerator(args['config']).generate_graph(dumped_repo)
+                if args['config'].get("pdf_engine", "networkx") == "networkx":
+                    generate_static_pdf_networkx(dumped_repo, args['config'], output_file="git_static.pdf")
+                else:
+                    GraphGenerator(args['config']).generate_graph(dumped_repo)
         elif args['repo_base']:
             generate_combined_repo_graph(args['repo_base'], args['config'])
         else:
@@ -1057,7 +935,10 @@ def main() -> None:
             if args['interactive']:
                 generate_interactive_visualization(repo, args['config'], output_file="git_interactive.html", view=(not args['config']['output_only']))
             else:
-                GraphGenerator(args['config']).generate_graph(repo)
+                if args['config'].get("pdf_engine", "networkx") == "networkx":
+                    generate_static_pdf_networkx(repo, args['config'], output_file="git_static.pdf")
+                else:
+                    GraphGenerator(args['config']).generate_graph(repo)
     except Exception as e:
         logging.exception("Unhandled error: %s", e)
         sys.exit(1)
