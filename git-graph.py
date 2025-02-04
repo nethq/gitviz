@@ -73,10 +73,9 @@ def get_distinct_color(index: int, total: int) -> str:
 def draw_grouped_nodes(subgraph: Digraph, nodes: List[dict], node_type: str,
                        prefix: str, config: dict) -> None:
     """
-    Given a list of node dictionaries (each with keys: id, common, differentiator, full_label, attrs),
-    group them by the common text. If a group contains only one element, draw it normally.
-    Otherwise, draw a single record–shaped node that shows the common part on the left and
-    the differentiators on the right.
+    Group a list of node dictionaries (each with keys: id, common, differentiator,
+    full_label, attrs) by the common text. Single–element groups are drawn normally;
+    groups with multiple elements are drawn as a record–shaped node.
     """
     groups = defaultdict(list)
     for node in nodes:
@@ -401,6 +400,8 @@ def add_git_repo_subgraph(master: Digraph, git_repo, config: dict,
     """
     drawn_edges = set()
     repo_cluster = master.subgraph(name=f"cluster_repo_{sanitize_id(prefix)}")
+    if not hasattr(repo_cluster, "attr"):
+        raise Exception("Subgraph creation failed: missing 'attr' method.")
     repo_cluster.attr(label=repo_label, color='blue')
     
     # --- Blobs ---
@@ -698,7 +699,11 @@ class GraphGenerator:
         logging.info("Generating Git object graph (single repository mode)")
         master = Digraph(comment='Git graph', format='pdf')
         master.attr(compound='true', splines='true', overlap='false')
-        add_git_repo_subgraph(master, git_repo, self.config, prefix="single", repo_label="Repository")
+        try:
+            add_git_repo_subgraph(master, git_repo, self.config, prefix="single", repo_label="Repository")
+        except Exception as e:
+            logging.error("Error generating subgraph for repository: %s", e)
+            sys.exit(1)
         try:
             logging.info("Rendering graph to file 'git.gv.pdf'")
             logging.debug("Graph source:\n%s", master.source)
