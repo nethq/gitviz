@@ -73,9 +73,9 @@ def get_distinct_color(index: int, total: int) -> str:
 def draw_grouped_nodes(subgraph: Digraph, nodes: List[dict], node_type: str,
                        prefix: str, config: dict) -> None:
     """
-    Group a list of node dictionaries (each with keys: id, common, differentiator,
-    full_label, attrs) by the common text. Single–element groups are drawn normally;
-    groups with multiple elements are drawn as a record–shaped node.
+    Given a list of node dictionaries (each with keys: id, common, differentiator,
+    full_label, attrs), group them by the common text. Single–element groups are drawn
+    normally; groups with multiple elements are drawn as a record–shaped node.
     """
     groups = defaultdict(list)
     for node in nodes:
@@ -97,6 +97,21 @@ def draw_grouped_nodes(subgraph: Digraph, nodes: List[dict], node_type: str,
                      'fontsize': str(10 + 2 * (1 - config.get('group_condense_level', 1)))}
             subgraph.node(group_node_id, label=record_label, **attrs)
             group_index += 1
+
+def create_subgraph(parent: Digraph, name: str, label: str = None, color: str = None) -> Digraph:
+    """
+    Helper function to create a subgraph, then set its attributes.
+    """
+    sub = parent.subgraph(name=name)
+    try:
+        if label:
+            sub.attr(label=label)
+        if color:
+            sub.attr(color=color)
+    except Exception as e:
+        logging.error("Failed to set attributes for subgraph %s: %s", name, e)
+        raise
+    return sub
 
 # --- Git Repository Data Model ---
 class GitRepo:
@@ -155,7 +170,15 @@ class GitRepo:
                             for f in files:
                                 branch_name = remote + '/' + f
                                 file_path = os.path.join(root, f)
-                                commit = self.read_txt(file_path)
+                                try:
+                                    commit = self.read_txt(file_path)
+                                except Exception as e:
+                                    logging.warning("Could not read remote branch file %s: %s", file_path, e)
+                                    continue
+                                # Validate commit hash (typically 7 to 40 hex digits)
+                                if not re.match(r'^[0-9a-f]{7,40}$', commit):
+                                    logging.warning("Remote branch '%s' in file %s does not contain a valid commit hash. Possibly due to permission restrictions. Skipping.", branch_name, file_path)
+                                    continue
                                 branches.append(Branch(name=branch_name, commit=commit, remote=True))
                                 logging.debug("Found remote branch '%s' -> %s", branch_name, commit)
                 except Exception as e:
@@ -203,17 +226,26 @@ class GitRepo:
         commit_data = {'hash': hash, 'tree': None, 'parents': []}
         author_found = False
         for line in content.splitlines():
-            if not line:
+            if not line.strip():
                 continue
             parts = line.split()
-            if parts[0] == 'tree':
+            if not parts:
+                continue
+            key = parts[0]
+            if key == 'tree':
+                if len(parts) < 2:
+                    logging.error("Malformed commit line for commit %s: %s", hash, line)
+                    continue
                 commit_data['tree'] = parts[1]
-            elif parts[0] == 'parent':
+            elif key == 'parent':
+                if len(parts) < 2:
+                    logging.error("Malformed commit parent for commit %s: %s", hash, line)
+                    continue
                 commit_data['parents'].append(parts[1])
-            elif parts[0] == 'author' and not author_found:
-                commit_data['author'] = ' '.join(parts[1:])
+            elif key == 'author' and not author_found:
+                commit_data['author'] = ' '.join(parts[1:]) if len(parts) > 1 else "Unknown"
                 author_found = True
-        if 'author' not in commit_data:
+        if 'author' not in commit_data or commit_data['author'] is None:
             commit_data['author'] = "Unknown"
         if not commit_data['tree']:
             raise ValueError(f"Commit {hash} missing tree pointer")
@@ -238,7 +270,7 @@ class GitRepo:
         trees_list = []
         blobs_list = []
         for line in content.splitlines():
-            if not line:
+            if not line.strip():
                 continue
             try:
                 mode, obj_type, child_hash, child_name = line.split(None, 3)
@@ -399,10 +431,7 @@ def add_git_repo_subgraph(master: Digraph, git_repo, config: dict,
     Supports grouping of repetitive nodes.
     """
     drawn_edges = set()
-    repo_cluster = master.subgraph(name=f"cluster_repo_{sanitize_id(prefix)}")
-    if not hasattr(repo_cluster, "attr"):
-        raise Exception("Subgraph creation failed: missing 'attr' method.")
-    repo_cluster.attr(label=repo_label, color='blue')
+    repo_cluster = create_subgraph(master, f"cluster_repo_{sanitize_id(prefix)}", label=repo_label, color='blue')
     
     # --- Blobs ---
     if config.get('group_enabled', False) and 'blob' in config.get('group_types', []):
@@ -419,12 +448,10 @@ def add_git_repo_subgraph(master: Digraph, git_repo, config: dict,
                 attrs['color'] = config['colors_map']['blob']
             nodes_list.append({"id": node_id, "common": common,
                                "differentiator": differentiator, "full_label": full_label, "attrs": attrs})
-        group_blob_sg = repo_cluster.subgraph(name=f"cluster_{prefix}_grouped_blobs")
-        group_blob_sg.attr(label="Blobs", color="gray")
+        group_blob_sg = create_subgraph(repo_cluster, f"cluster_{prefix}_grouped_blobs", label="Blobs", color="gray")
         draw_grouped_nodes(group_blob_sg, nodes_list, "blob", prefix, config)
     else:
-        blob_sg = repo_cluster.subgraph(name=f"cluster_{prefix}_blobs")
-        blob_sg.attr(label='Blobs', color='gray')
+        blob_sg = create_subgraph(repo_cluster, f"cluster_{prefix}_blobs", label="Blobs", color="gray")
         for blob in git_repo.blobs.values():
             blob_name = getattr(blob, 'name', str(blob))
             blob_hash = getattr(blob, 'hash', '')
@@ -454,12 +481,10 @@ def add_git_repo_subgraph(master: Digraph, git_repo, config: dict,
                 attrs['color'] = config['colors_map']['tree']
             nodes_list.append({"id": node_id, "common": common,
                                "differentiator": differentiator, "full_label": full_label, "attrs": attrs})
-        group_tree_sg = repo_cluster.subgraph(name=f"cluster_{prefix}_grouped_trees")
-        group_tree_sg.attr(label="Trees", color="gray")
+        group_tree_sg = create_subgraph(repo_cluster, f"cluster_{prefix}_grouped_trees", label="Trees", color="gray")
         draw_grouped_nodes(group_tree_sg, nodes_list, "tree", prefix, config)
     else:
-        tree_sg = repo_cluster.subgraph(name=f"cluster_{prefix}_trees")
-        tree_sg.attr(label='Trees', color='gray')
+        tree_sg = create_subgraph(repo_cluster, f"cluster_{prefix}_trees", label="Trees", color="gray")
         for tree_hash, blob_hashes in git_repo.tree_to_blobs.items():
             try:
                 tree_obj = git_repo.get_tree(tree_hash)
@@ -513,8 +538,7 @@ def add_git_repo_subgraph(master: Digraph, git_repo, config: dict,
                 tree_sg.edge(tree_nid, subtree_nid, minlen='2', constraint='true')
                     
     # --- Commits ---
-    commit_sg = repo_cluster.subgraph(name=f"cluster_{prefix}_commits")
-    commit_sg.attr(label='Commits', color='gray')
+    commit_sg = create_subgraph(repo_cluster, f"cluster_{prefix}_commits", label="Commits", color="gray")
     for commit_hash, tree_hash in git_repo.commit_to_tree.items():
         try:
             commit_obj = git_repo.get_commit(commit_hash)
@@ -582,8 +606,7 @@ def add_git_repo_subgraph(master: Digraph, git_repo, config: dict,
                 drawn_edges.add(edge_key)
                     
     # --- Branches ---
-    branch_sg = repo_cluster.subgraph(name=f"cluster_{prefix}_branches")
-    branch_sg.attr(label='Branches', color='gray')
+    branch_sg = create_subgraph(repo_cluster, f"cluster_{prefix}_branches", label="Branches", color="gray")
     for branch_name, commit_hash in git_repo.branch_to_commit.items():
         branch_nid = make_node_id(prefix, "branch", branch_name)
         attrs = {'shape': 'parallelogram'}
@@ -599,8 +622,7 @@ def add_git_repo_subgraph(master: Digraph, git_repo, config: dict,
         
     # --- Legend ---
     if config['colors']:
-        legend = repo_cluster.subgraph(name=f"cluster_{prefix}_legend")
-        legend.attr(label='Legend', color='black')
+        legend = create_subgraph(repo_cluster, f"cluster_{prefix}_legend", label="Legend", color="black")
         for nodetype, col in config['colors_map'].items():
             node_id = f"legend_{nodetype}"
             legend.node(node_id, label=nodetype.capitalize(), shape='box', style='filled', color=col)
@@ -639,8 +661,7 @@ def generate_combined_repo_graph(repo_base_path: str, config: dict) -> None:
     master.attr(compound='true', splines='true', overlap='false')
 
     # Project structure cluster.
-    proj_cluster = master.subgraph(name="cluster_project_structure")
-    proj_cluster.attr(label="Project Structure", color="black")
+    proj_cluster = create_subgraph(master, "cluster_project_structure", label="Project Structure", color="black")
     node_counter = [0]
     def process_directory(dir_path: str, parent_id: str = None, depth: int = 0, max_depth: int = config.get('max_depth', 10)):
         try:
@@ -669,8 +690,7 @@ def generate_combined_repo_graph(repo_base_path: str, config: dict) -> None:
     process_directory(repo_base_path)
 
     # Git repositories cluster.
-    repos_cluster = master.subgraph(name="cluster_git_repos")
-    repos_cluster.attr(label="Git Repositories", color="blue")
+    repos_cluster = create_subgraph(master, "cluster_git_repos", label="Git Repositories", color="blue")
     for idx, (repo_abs, rel_path) in enumerate(git_repos):
         prefix = f"repo{idx}_{sanitize_id(rel_path)}"
         logging.info("Processing repository at '%s' (relative: '%s')", repo_abs, rel_path)
