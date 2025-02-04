@@ -101,16 +101,15 @@ def draw_grouped_nodes(subgraph: Digraph, nodes: List[dict], node_type: str,
 def create_subgraph(parent: Digraph, name: str, label: str = None, color: str = None) -> Digraph:
     """
     Helper function to create a subgraph, then set its attributes.
+    This version handles the Graphviz subgraph context manager by calling __enter__() immediately.
     """
     sub = parent.subgraph(name=name)
-    try:
-        if label:
-            sub.attr(label=label)
-        if color:
-            sub.attr(color=color)
-    except Exception as e:
-        logging.error("Failed to set attributes for subgraph %s: %s", name, e)
-        raise
+    if hasattr(sub, '__enter__'):
+        sub = sub.__enter__()
+    if label:
+        sub.attr(label=label)
+    if color:
+        sub.attr(color=color)
     return sub
 
 # --- Git Repository Data Model ---
@@ -153,8 +152,9 @@ class GitRepo:
                 for f in os.listdir(heads_dir):
                     full_path = os.path.join(heads_dir, f)
                     commit = self.read_txt(full_path)
-                    branches.append(Branch(name=f, commit=commit, remote=False))
-                    logging.debug("Found local branch '%s' -> %s", f, commit)
+                    if commit:
+                        branches.append(Branch(name=f, commit=commit, remote=False))
+                        logging.debug("Found local branch '%s' -> %s", f, commit)
             except Exception as e:
                 logging.error("Error listing local branches: %s", e)
                 raise
