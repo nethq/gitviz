@@ -21,8 +21,6 @@ from graphviz import Digraph
 from types import SimpleNamespace
 from typing import Dict, Set, List, Optional
 
-__version__ = "99.102+"
-
 # ---------------------- GIT OBJECT TYPES -------------------------
 Branch = collections.namedtuple('Branch', 'name commit remote')
 Commit = collections.namedtuple('Commit', 'hash tree parents author')
@@ -535,7 +533,12 @@ def build_graph_data(repo_obj, config: dict, prefix: str = "interactive") -> Dic
 
     return {"nodes": list(nodes.values()), "edges": edges}
 
-def generate_interactive_visualization(repo_obj, config: dict,
+import json, os, logging
+from typing import Dict, List, Optional
+import webbrowser
+
+def generate_interactive_visualization(repo_obj,
+                                       config: dict,
                                        prefix: str = "interactive",
                                        repo_label: str = "Repository",
                                        output_file: str = "git_interactive.html",
@@ -545,42 +548,110 @@ def generate_interactive_visualization(repo_obj, config: dict,
       - hierarchical layout,
       - physics disabled after initial layout so nodes won't drift,
       - multi-branch color edges,
-      - ability to drag nodes without them snapping back,
-      - minimal overlap.
+      - ability to drag nodes,
+      - minimal overlap,
+      - right-click context menu on commits (highlight, collapse, uncollapse),
+      - dark mode toggle.
     """
     try:
+        # 1) Build the minimal node/edge data
         graph_data = build_graph_data(repo_obj, config, prefix)
-        # Hierarchical layout direction (vertical or horizontal)
+
+        # 2) We'll also build a simple adjacency list (for descendants) so we can highlight/collapse
+        #    For simplicity, we consider edges from parent -> child as "descendant" edges.
+        #    If you want ancestors, you’d invert this.
+        adjacency_map = {}
+        for edge in graph_data["edges"]:
+            src = edge["to"]     # parent
+            dst = edge["from"]   # child
+            adjacency_map.setdefault(src, []).append(dst)
+
+        # 3) Choose layout direction (vertical or horizontal)
         direction = "UD" if config.get("layout_orientation", "vertical") == "vertical" else "LR"
 
-        # The HTML template below disables continual physics so items do not sway.
+        # 4) The HTML template with added right-click context menu + dark mode toggle
         html_template = f"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
   <title>Git Graph Interactive Visualization</title>
+  <!-- Load vis-network from a CDN -->
   <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
   <style type="text/css">
     html, body {{
-      margin: 0;
-      padding: 0;
-      width: 100%;
-      height: 100%;
-      overflow: hidden;
+      margin: 0; padding: 0;
+      width: 100%; height: 100%;
       font-family: sans-serif;
+      overflow: hidden;
     }}
     #network {{
-      width: 100%;
-      height: 100%;
+      width: 100%; height: 100%;
       border: 1px solid lightgray;
+      position: relative;
+    }}
+
+    /* Context menu styling */
+    #contextMenu {{
+      position: absolute;
+      z-index: 9999;
+      display: none;
+      background: #f8f8f8;
+      border: 1px solid #ccc;
+      min-width: 150px;
+      box-shadow: 2px 2px 5px rgba(0,0,0,0.2);
+    }}
+    #contextMenu ul {{
+      list-style-type: none;
+      margin: 0; padding: 0;
+    }}
+    #contextMenu li {{
+      padding: 8px 12px;
+      cursor: pointer;
+    }}
+    #contextMenu li:hover {{
+      background: #e0e0e0;
+    }}
+
+    /* Dark mode support: toggled by adding 'dark-mode' to <body> */
+    body.dark-mode {{
+      background-color: #222;
+      color: #eee;
+    }}
+    body.dark-mode #network {{
+      border-color: #444;
+    }}
+    body.dark-mode #contextMenu {{
+      background: #333;
+      color: #eee;
+      border-color: #666;
+    }}
+    body.dark-mode #contextMenu li:hover {{
+      background: #444;
     }}
   </style>
 </head>
 <body>
+  <button id="darkModeToggle" style="position:absolute; top:8px; left:8px; z-index:9999;">
+    Toggle Dark Mode
+  </button>
   <div id="network"></div>
+
+  <!-- Our custom context menu -->
+  <div id="contextMenu">
+    <ul>
+      <li id="highlightTreeBtn">Highlight Tree</li>
+      <li id="collapseOthersBtn">Collapse All Others</li>
+      <li id="uncollapseBtn">Uncollapse All</li>
+    </ul>
+  </div>
+
   <script type="text/javascript">
+    // --- Data from Python:
+    const graphData = {json.dumps(graph_data)};
+    const adjacency = {json.dumps(adjacency_map)};
+
+    // Vis-network init
     const container = document.getElementById('network');
-    const data = {json.dumps(graph_data)};
     const options = {{
       layout: {{
         hierarchical: {{
@@ -592,10 +663,10 @@ def generate_interactive_visualization(repo_obj, config: dict,
         }}
       }},
       physics: {{
-        enabled: false   // Disable ongoing physics so nodes remain where placed
+        enabled: false  // after initial layout, no drifting
       }},
       interaction: {{
-        dragNodes: true,    // Allow the user to drag nodes
+        dragNodes: true,
         hover: true,
         tooltipDelay: 200,
         hideEdgesOnDrag: false
@@ -613,30 +684,172 @@ def generate_interactive_visualization(repo_obj, config: dict,
           type: 'cubicBezier',
           roundness: 0.3
         }},
-        width: 2
+        width: 2,
+        color: '#333'
       }}
     }};
-    const network = new vis.Network(container, data, options);
 
-    // Optional: if you want a quick "fit" to ensure everything is visible:
+    const network = new vis.Network(container, graphData, options);
     network.fit();
 
-    // (No continuous forces. Once laid out, everything remains stable.)
+    // For convenience, keep track of hidden nodes so we can uncollapse later
+    let hiddenNodes = new Set();
+
+    // For context menu logic:
+    let currentNode = null;      // which node was right-clicked
+    let clickPos = {{x: 0, y: 0}};
+
+    const contextMenu = document.getElementById("contextMenu");
+    const highlightBtn = document.getElementById("highlightTreeBtn");
+    const collapseBtn = document.getElementById("collapseOthersBtn");
+    const uncollapseBtn = document.getElementById("uncollapseBtn");
+
+    // Right-click (contextmenu) event on the network:
+    network.on("oncontext", function(params) {{
+      params.event.preventDefault();
+
+      // Hide context menu by default
+      contextMenu.style.display = "none";
+
+      // Get the pointer/touch position
+      clickPos.x = params.pointer.DOM.x;
+      clickPos.y = params.pointer.DOM.y;
+
+      // Check if a node is right-clicked
+      const nodeIds = network.getNodeAt({{x: clickPos.x, y: clickPos.y}});
+      if (nodeIds) {{
+        currentNode = nodeIds;
+        // Show the menu at the cursor
+        contextMenu.style.left = params.event.clientX + "px";
+        contextMenu.style.top = params.event.clientY + "px";
+        contextMenu.style.display = "block";
+      }} else {{
+        currentNode = null;
+      }}
+    }});
+
+    // Hide the context menu if user left-clicks anywhere
+    container.addEventListener("click", () => {{
+      contextMenu.style.display = "none";
+    }});
+
+    // Utility: get subtree (descendants) starting at 'node'
+    // You can invert it if you want ancestors, or do both if you want the entire lineage.
+    function getSubtreeNodes(node) {{
+      let result = new Set();
+      let stack = [node];
+      while(stack.length > 0) {{
+        let n = stack.pop();
+        if(!result.has(n)) {{
+          result.add(n);
+          if(adjacency[n]) {{
+            adjacency[n].forEach(child => {{
+              stack.push(child);
+            }});
+          }}
+        }}
+      }}
+      return result;
+    }}
+
+    // 1) Highlight the subtree
+    highlightBtn.onclick = function() {{
+      contextMenu.style.display = "none";
+      if(!currentNode) return;
+
+      // We'll gather all subtree nodes and give them a special color
+      let subtree = getSubtreeNodes(currentNode);
+
+      // Reset all nodes to default first
+      let allNodeIds = network.body.data.nodes.getIds();
+      allNodeIds.forEach(id => {{
+        network.body.data.nodes.update({{ id, color: undefined }});
+      }});
+
+      // Now highlight the subtree in, say, gold
+      subtree.forEach(id => {{
+        network.body.data.nodes.update({{ id, color: {{
+          background: "gold", border: "#cc0"
+        }} }});
+      }});
+    }}
+
+    // 2) Collapse all others => hide nodes not in the subtree
+    collapseBtn.onclick = function() {{
+      contextMenu.style.display = "none";
+      if(!currentNode) return;
+
+      let subtree = getSubtreeNodes(currentNode);
+      let allNodeIds = network.body.data.nodes.getIds();
+
+      // We'll hide every node *not* in that subtree
+      let updates = [];
+      allNodeIds.forEach(id => {{
+        if(!subtree.has(id)) {{
+          hiddenNodes.add(id);
+          updates.push({{ id, hidden: true }});
+        }}
+      }});
+      if(updates.length > 0) {{
+        network.body.data.nodes.update(updates);
+      }}
+    }}
+
+    // 3) Uncollapse all => simply show every node again
+    uncollapseBtn.onclick = function() {{
+      contextMenu.style.display = "none";
+      if(hiddenNodes.size === 0) return;
+
+      let updates = [];
+      hiddenNodes.forEach(id => {{
+        updates.push({{ id, hidden: false }});
+      }});
+      network.body.data.nodes.update(updates);
+      hiddenNodes.clear();
+    }}
+
+    // Dark mode toggle
+    const darkModeToggle = document.getElementById("darkModeToggle");
+    darkModeToggle.onclick = function() {{
+      document.body.classList.toggle("dark-mode");
+
+      // Adjust default font color for nodes if in dark mode
+      let isDark = document.body.classList.contains("dark-mode");
+      let newFontColor = isDark ? "#eee" : "#000";
+      let newEdgeColor = isDark ? "#aaa" : "#333";
+
+      // Update all node fonts
+      let allNodeIds = network.body.data.nodes.getIds();
+      allNodeIds.forEach(id => {{
+        // We only update the 'font.color'; you might also want
+        // to adjust background color if it was white/black.
+        network.body.data.nodes.update({{ id, font: {{ color: newFontColor }} }});
+      }});
+
+      // Update all edges color
+      let allEdges = network.body.data.edges.get();
+      allEdges.forEach(edge => {{
+        edge.color = newEdgeColor;
+      }});
+      network.body.data.edges.update(allEdges);
+    }};
   </script>
 </body>
 </html>
 """
+
+        # 5) Write out the file
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write(html_template)
 
-        logging.info("Interactive visualization written to '%s'", output_file)
+        logging.info("Interactive visualization (with context menu & dark mode) written to '%s'", output_file)
         if view:
-            import webbrowser
             webbrowser.open('file://' + os.path.realpath(output_file))
+
     except Exception as e:
         logging.error("Error generating interactive visualization: %s", e)
+        import sys
         sys.exit(1)
-
 # ---------------------- STATIC GRAPH (PDF) ENGINE: NETWORKX -------------------------
 
 def generate_static_pdf_networkx(repo_obj, config: dict, output_file: str = "git_static.pdf") -> None:
